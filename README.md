@@ -1,14 +1,12 @@
 # Blender Dice Gen
 
-A Blender add-on that generates polyhedral dice, with built-in resin fin supports and a separate resin auto-support addon for merged print meshes.
+A Blender add-on that generates polyhedral dice, with built-in resin fin supports for resin printing.
 
 ![](https://github.com/user-attachments/assets/52db5bd6-0d78-4d2a-b9cd-36b29cd95511)
 
 ## Installation and usage
 
 Download the [main python script](https://github.com/shawn-makes-stuff/DiceGen5.0/blob/main/DiceGen5.py), then go to `Edit > Preferences... > Add-ons > Install...` and select the file.
-
-If you also want automatic resin supports after you merge the finished die, install [DiceGenResinAutoSupports.py](https://github.com/shawn-makes-stuff/DiceGen5.0/blob/main/DiceGenResinAutoSupports.py) as a second addon.
 
 Afterwards you will be able to generate dice in `Add > Mesh > Dice` or `Sidebar > DiceGen5 > Add Dice to Scene`.
 
@@ -40,37 +38,19 @@ The add-on will create a blank dice mesh and, if enabled, a separate numbers obj
 - Added new Dice Gen section to Object properties to allow quick configuration changes of individual dice
 - Added new Dice Gen sidebar menu option to allow quickly creating multiple dice with the same configuration
 - Built-in resin fin supports for point-down printing
-- Separate resin auto-support addon for merged meshes and island cleanup
 - Automatic per-die collections to keep multi-die scenes organized
 
-## Resin fin supports
+## Settings reference
 
-`DiceGen5.py` includes a built-in fin support workflow intended for resin printing.
+Detailed setting documentation is in [SETTINGS.md](SETTINGS.md).
 
-- Dice are print-oriented with a point facing down.
-- Fin supports are generated as real meshes as part of the dice builder.
-- Fins are built along the point-down support edges and intersect the die body slightly so chamfer and bevel finishes still connect cleanly.
-- The fin edge height stops at the real edge length of the current die.
+- Global settings
+- Number and indicator settings
+- Custom image settings
+- Resin fin support settings
+- Geometry-specific settings
+- Workflow notes
 
-### Fin support settings
-
-- `Generate Fin Supports`: turn fin generation on or off
-- `Fin Edge Height`: how far up the supporting edges the fin climbs
-- `Top Edge Thickness`: thickness where the fin meets the die
-- `Bottom Edge Thickness`: thickness where the fin meets the raft
-- `Fin Drop`: distance from die to raft
-- `Raft Margin`: expands the raft footprint
-- `Raft Thickness`: sets raft thickness
-- `Raft Taper`: narrows the raft toward the build plate for easier removal
-
-## Resin auto supports
-
-`DiceGenResinAutoSupports.py` is a separate addon for the final merged mesh.
-
-- Works on a selected merged mesh
-- Samples downward-facing surfaces
-- Detects unsupported islands and long unsupported spans
-- Generates mesh-based supports with configurable contacts, shafts, bases, and braces
 
 ## Tips
 
