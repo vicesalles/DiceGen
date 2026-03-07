@@ -1,4 +1,5 @@
 import math
+import re
 import bpy
 import os
 import bmesh
@@ -25,6 +26,15 @@ bl_info = {
 NUMBER_IND_NONE = 'none'
 NUMBER_IND_BAR = 'bar'
 NUMBER_IND_PERIOD = 'period'
+PANEL_POCKET_BOOLEAN_NAME = "panel_pocket_boolean"
+PANEL_NUMBER_BOOLEAN_NAME = "panel_number_boolean"
+PANEL_TOP_FACE_BOOLEAN_NAME = "panel_top_face_boolean"
+PANEL_OBJECT_KEY = "dice_panels_name"
+PANEL_CUTTER_KEY = "dice_panel_cutter_name"
+PANEL_NUMBER_CUTTER_KEY = "dice_panel_numbers_name"
+PANEL_TOP_FACE_CUTTER_KEY = "dice_top_face_cutter_name"
+FIN_SUPPORT_OBJECT_KEY = "dice_fin_support_name"
+FIN_SUPPORT_BODY_INTERSECTION = 1.0
 
 HALF_PI = math.pi / 2
 THIRD_PI = math.pi / 3
@@ -138,6 +148,10 @@ class Mesh:
         self.name = name
         self.dice_mesh = None
         self.base_font_scale = 1
+        self.print_rotation = Matrix.Identity(3)
+        self.print_lift = 0.0
+        self.output_vertices = None
+        self._print_layout_applied = False
 
     def create(self, context) -> bpy.types.Object:
         """
@@ -149,7 +163,7 @@ class Mesh:
         Returns:
             The created mesh object
         """
-        self.dice_mesh = create_mesh(context, self.vertices, self.faces, self.name)
+        self.dice_mesh = create_mesh(context, self.get_output_vertices(), self.faces, self.name)
         # reset transforms
         self.dice_mesh.matrix_world = Matrix()
         return self.dice_mesh
@@ -181,13 +195,64 @@ class Mesh:
         """
         return []
 
+    def apply_print_layout(self, lift_height: float = 0.0) -> None:
+        if self._print_layout_applied or not self.vertices:
+            return
+
+        vertex_vectors = [Vector(vertex) for vertex in self.vertices]
+        bottom_index = min(
+            range(len(vertex_vectors)),
+            key=lambda index: (
+                vertex_vectors[index].z,
+                vertex_vectors[index].x * vertex_vectors[index].x + vertex_vectors[index].y * vertex_vectors[index].y,
+                vertex_vectors[index].x,
+                vertex_vectors[index].y,
+            ),
+        )
+        bottom_vector = vertex_vectors[bottom_index]
+        target_vector = Vector((0.0, 0.0, -1.0))
+
+        if bottom_vector.length > 1e-6:
+            rotation = bottom_vector.normalized().rotation_difference(target_vector).to_matrix()
+        else:
+            rotation = Matrix.Identity(3)
+
+        rotated_vertices = [rotation @ vertex for vertex in vertex_vectors]
+        min_z = min(vertex.z for vertex in rotated_vertices)
+        z_offset = lift_height - min_z
+        translated_vertices = [vertex + Vector((0.0, 0.0, z_offset)) for vertex in rotated_vertices]
+
+        self.output_vertices = [(vertex.x, vertex.y, vertex.z) for vertex in translated_vertices]
+        self.print_rotation = rotation
+        self.print_lift = z_offset
+        self._print_layout_applied = True
+
+    def get_output_vertices(self) -> List[Tuple[float, float, float]]:
+        return self.output_vertices if self.output_vertices is not None else self.vertices
+
+    def transform_number_locations(self, locations: List[Tuple[float, float, float]]) -> List[Tuple[float, float, float]]:
+        transformed: List[Tuple[float, float, float]] = []
+        for location in locations:
+            point = self.print_rotation @ Vector(location)
+            point.z += self.print_lift
+            transformed.append((point.x, point.y, point.z))
+        return transformed
+
+    def transform_number_rotations(self, rotations: List[Tuple[float, float, float]]) -> List[Tuple[float, float, float]]:
+        transformed: List[Tuple[float, float, float]] = []
+        for rotation in rotations:
+            rotation_matrix = self.print_rotation @ Euler(rotation, 'XYZ').to_matrix()
+            transformed_euler = rotation_matrix.to_euler('XYZ')
+            transformed.append((transformed_euler.x, transformed_euler.y, transformed_euler.z))
+        return transformed
+
     def create_numbers(self, context, size, number_scale, number_depth, font_path,
                        number_indicator_type=NUMBER_IND_NONE, period_indicator_scale=1, period_indicator_space=1,
                        bar_indicator_height=1, bar_indicator_width=1, bar_indicator_space=1,
                        center_bar=True, custom_image_face=0, custom_image_path='', custom_image_scale=1):
         numbers = self.get_numbers()
-        locations = self.get_number_locations()
-        rotations = self.get_number_rotations()
+        locations = self.transform_number_locations(self.get_number_locations())
+        rotations = self.transform_number_rotations(self.get_number_rotations())
 
         font_size = self.base_font_scale * size * number_scale
 
@@ -1809,6 +1874,105 @@ def create_mesh(context, vertices: List[Tuple[float, float, float]],
     return object_data_add(context, mesh, operator=None)
 
 
+def create_mesh_object(name: str,
+                       vertices: List[Tuple[float, float, float]],
+                       faces: List[List[int]],
+                       collection: Optional[bpy.types.Collection] = None) -> bpy.types.Object:
+    mesh = bpy.data.meshes.new(name)
+    mesh.from_pydata(vertices, [], faces)
+    mesh.update()
+
+    obj = bpy.data.objects.new(name, mesh)
+    target_collection = collection or bpy.context.collection or bpy.context.scene.collection
+    target_collection.objects.link(obj)
+    return obj
+
+
+def rebuild_mesh_object(obj: bpy.types.Object,
+                        vertices: List[Tuple[float, float, float]],
+                        faces: List[List[int]]) -> None:
+    if obj is None or obj.type != 'MESH':
+        return
+
+    old_mesh = obj.data
+    materials = [material for material in old_mesh.materials]
+
+    new_mesh = bpy.data.meshes.new(old_mesh.name)
+    new_mesh.from_pydata(vertices, [], faces)
+    new_mesh.update()
+    for material in materials:
+        new_mesh.materials.append(material)
+
+    obj.data = new_mesh
+    if old_mesh.users == 0:
+        bpy.data.meshes.remove(old_mesh)
+
+
+def create_dice_collection(context, name: str) -> bpy.types.Collection:
+    collection = bpy.data.collections.new(name)
+    parent_collection = context.collection if context.collection is not None else context.scene.collection
+    parent_collection.children.link(collection)
+    return collection
+
+
+def get_dice_type_label(dice_type: str) -> str:
+    labels = {
+        'D4': 'D4',
+        'D4_CRYSTAL': 'D4 Crystal',
+        'D4_SHARD': 'D4 Shard',
+        'D6': 'D6',
+        'D8': 'D8',
+        'D10': 'D10',
+        'D12': 'D12',
+        'D20': 'D20',
+        'D100': 'D100',
+        'CUSTOM_CRYSTAL': 'Custom Crystal',
+        'CUSTOM_SHARD': 'Custom Shard',
+        'CUSTOM_BIPYRAMID': 'Custom Bipyramid',
+        'CUSTOM_TRAP': 'Custom Trapezohedron',
+    }
+    return labels.get(dice_type, dice_type.replace('_', ' ').title())
+
+
+def move_object_to_collection(obj: Optional[bpy.types.Object], target_collection: bpy.types.Collection) -> None:
+    if obj is None or target_collection is None:
+        return
+
+    if target_collection not in obj.users_collection:
+        target_collection.objects.link(obj)
+
+    for collection in list(obj.users_collection):
+        if collection != target_collection:
+            collection.objects.unlink(obj)
+
+
+def organize_dice_objects_in_collection(body_object: bpy.types.Object,
+                                        target_collection: bpy.types.Collection,
+                                        extra_objects: Optional[List[Optional[bpy.types.Object]]] = None) -> None:
+    if body_object is None or target_collection is None:
+        return
+
+    objects_to_move: List[Optional[bpy.types.Object]] = [body_object]
+
+    numbers_name = body_object.get("dice_numbers_name")
+    if numbers_name:
+        objects_to_move.append(bpy.data.objects.get(numbers_name))
+
+    fin_support_name = body_object.get(FIN_SUPPORT_OBJECT_KEY)
+    if fin_support_name:
+        objects_to_move.append(bpy.data.objects.get(fin_support_name))
+
+    if extra_objects:
+        objects_to_move.extend(extra_objects)
+
+    seen = set()
+    for obj in objects_to_move:
+        if obj is None or obj.name in seen:
+            continue
+        seen.add(obj.name)
+        move_object_to_collection(obj, target_collection)
+
+
 def ensure_material(name: str, base_color: Tuple[float, float, float, float]) -> bpy.types.Material:
     """
     Create or retrieve a material with the specified name and color.
@@ -1994,6 +2158,14 @@ SETTINGS_ATTRS = [
     "font_path",
     "number_scale",
     "number_depth",
+    "add_fin_supports",
+    "fin_support_contour_offset",
+    "fin_support_connection_thickness",
+    "fin_support_thickness",
+    "fin_support_drop",
+    "fin_support_raft_margin",
+    "fin_support_raft_thickness",
+    "fin_support_raft_taper",
     "add_numbers",
     "number_indicator_type",
     "period_indicator_scale",
@@ -2034,6 +2206,12 @@ def resolve_settings_owner(obj):
     if obj is None or not hasattr(obj, "dice_gen_settings"):
         return None
 
+    body_name = obj.get("dice_body_name")
+    if body_name and body_name in bpy.data.objects:
+        body_obj = bpy.data.objects[body_name]
+        if hasattr(body_obj, "dice_gen_settings") and body_obj.get("dice_gen_type") is not None:
+            return body_obj
+
     if obj.get("dice_gen_type") is not None:
         return obj
 
@@ -2070,7 +2248,8 @@ def get_font(filepath: str) -> bpy.types.VectorFont:
     return bpy.data.fonts[0]
 
 
-def apply_boolean_modifier(body_object, numbers_object):
+def apply_boolean_modifier(body_object, numbers_object, modifier_name='boolean',
+                           remember_key="dice_numbers_name", show_viewport=False):
     """
     Add a BOOLEAN modifier to body_object that targets
     :param context:
@@ -2078,12 +2257,414 @@ def apply_boolean_modifier(body_object, numbers_object):
     :param numbers_object
     :return:
     """
-    numbers_boolean = body_object.modifiers.new(type='BOOLEAN', name='boolean')
+    numbers_boolean = body_object.modifiers.new(type='BOOLEAN', name=modifier_name)
     numbers_boolean.object = bpy.data.objects[numbers_object.name]
-    numbers_boolean.show_viewport = False
+    numbers_boolean.show_viewport = show_viewport
+    if hasattr(numbers_boolean, "operation"):
+        numbers_boolean.operation = 'DIFFERENCE'
+    if hasattr(numbers_boolean, "solver"):
+        # Prefer FLOAT when available; fallback to other supported solvers.
+        for solver_name in ("FLOAT", "EXACT", "FAST"):
+            try:
+                numbers_boolean.solver = solver_name
+                break
+            except (TypeError, ValueError, AttributeError):
+                continue
 
-    # remember the numbers object for regeneration
-    body_object["dice_numbers_name"] = numbers_object.name
+    if remember_key:
+        body_object[remember_key] = numbers_object.name
+
+
+def remove_object_if_exists(name: str) -> None:
+    if not name:
+        return
+
+    obj = bpy.data.objects.get(name)
+    if obj is None:
+        return
+
+    bpy.data.objects.remove(obj, do_unlink=True)
+
+
+def remove_modifier_if_exists(obj: bpy.types.Object, modifier_name: str) -> None:
+    if obj is None:
+        return
+
+    modifier = obj.modifiers.get(modifier_name)
+    if modifier is not None:
+        obj.modifiers.remove(modifier)
+
+
+def clear_panel_artifacts(body_object: bpy.types.Object) -> None:
+    if body_object is None:
+        return
+
+    remove_modifier_if_exists(body_object, PANEL_POCKET_BOOLEAN_NAME)
+    remove_modifier_if_exists(body_object, PANEL_TOP_FACE_BOOLEAN_NAME)
+
+    for key in (PANEL_OBJECT_KEY, PANEL_CUTTER_KEY, PANEL_NUMBER_CUTTER_KEY, PANEL_TOP_FACE_CUTTER_KEY):
+        object_name = body_object.get(key)
+        if object_name:
+            remove_object_if_exists(object_name)
+            del body_object[key]
+
+
+def clear_fin_support_artifacts(body_object: bpy.types.Object) -> None:
+    if body_object is None:
+        return
+
+    support_name = body_object.get(FIN_SUPPORT_OBJECT_KEY)
+    if support_name:
+        remove_object_if_exists(support_name)
+        del body_object[FIN_SUPPORT_OBJECT_KEY]
+
+
+def dedupe_loop_points(points: List[Vector], tolerance: float = 1e-5) -> List[Vector]:
+    unique: List[Vector] = []
+    for point in points:
+        if not any((point - existing).length <= tolerance for existing in unique):
+            unique.append(point.copy())
+    return unique
+
+
+def polygon_area_xy(points: List[Vector]) -> float:
+    if len(points) < 3:
+        return 0.0
+
+    area = 0.0
+    for index, point in enumerate(points):
+        next_point = points[(index + 1) % len(points)]
+        area += point.x * next_point.y - next_point.x * point.y
+    return area * 0.5
+
+
+def offset_convex_loop(points: List[Vector], offset: float) -> List[Vector]:
+    if len(points) < 3 or abs(offset) <= 1e-6:
+        return [point.copy() for point in points]
+
+    orientation = 1.0 if polygon_area_xy(points) >= 0 else -1.0
+    offset_points: List[Vector] = []
+
+    for index, point in enumerate(points):
+        previous_point = points[index - 1]
+        next_point = points[(index + 1) % len(points)]
+        previous_edge = Vector((point.x - previous_point.x, point.y - previous_point.y, 0.0))
+        next_edge = Vector((next_point.x - point.x, next_point.y - point.y, 0.0))
+
+        if previous_edge.length <= 1e-6 or next_edge.length <= 1e-6:
+            offset_points.append(point.copy())
+            continue
+
+        previous_edge.normalize()
+        next_edge.normalize()
+
+        if orientation > 0:
+            previous_normal = Vector((previous_edge.y, -previous_edge.x, 0.0))
+            next_normal = Vector((next_edge.y, -next_edge.x, 0.0))
+        else:
+            previous_normal = Vector((-previous_edge.y, previous_edge.x, 0.0))
+            next_normal = Vector((-next_edge.y, next_edge.x, 0.0))
+
+        miter = previous_normal + next_normal
+        if miter.length <= 1e-6:
+            offset_points.append(point + next_normal * offset)
+            continue
+
+        miter.normalize()
+        scale = offset / max(miter.dot(next_normal), 0.2)
+        offset_points.append(point + miter * scale)
+
+    return offset_points
+
+
+def build_fin_support_loop(vertices: List[Tuple[float, float, float]],
+                           faces: List[List[int]],
+                           plane_z: float,
+                           fallback_band: float) -> List[Vector]:
+    plane_points: List[Vector] = []
+    epsilon = 1e-5
+
+    for face in faces:
+        face_points: List[Vector] = []
+        for edge_index, start_index in enumerate(face):
+            end_index = face[(edge_index + 1) % len(face)]
+            start = Vector(vertices[start_index])
+            end = Vector(vertices[end_index])
+            start_distance = start.z - plane_z
+            end_distance = end.z - plane_z
+
+            if abs(start_distance) <= epsilon and abs(end_distance) <= epsilon:
+                face_points.extend([start, end])
+                continue
+
+            if abs(start_distance) <= epsilon:
+                face_points.append(start)
+                continue
+
+            if abs(end_distance) <= epsilon:
+                face_points.append(end)
+                continue
+
+            if start_distance * end_distance < 0:
+                factor = (plane_z - start.z) / (end.z - start.z)
+                face_points.append(start.lerp(end, factor))
+
+        plane_points.extend(dedupe_loop_points(face_points))
+
+    plane_points = dedupe_loop_points(plane_points)
+
+    if len(plane_points) < 3:
+        band_limit = plane_z + max(fallback_band, 0.05)
+        plane_points = dedupe_loop_points([
+            Vector((vertex[0], vertex[1], plane_z))
+            for vertex in vertices
+            if vertex[2] <= band_limit
+        ])
+
+    if len(plane_points) < 3:
+        return []
+
+    center = sum(plane_points, Vector((0.0, 0.0, 0.0))) / len(plane_points)
+    plane_points.sort(key=lambda point: math.atan2(point.y - center.y, point.x - center.x))
+
+    if polygon_area_xy(plane_points) < 0:
+        plane_points.reverse()
+
+    return plane_points
+
+
+def append_fin_segment(vertices: List[Tuple[float, float, float]],
+                       faces: List[List[int]],
+                       top_start: Vector,
+                       top_end: Vector,
+                       base_start: Vector,
+                       base_end: Vector,
+                       start_half_thickness: float,
+                       end_half_thickness: float,
+                       base_start_half_thickness: float,
+                       base_end_half_thickness: float,
+                       orientation_sign: float) -> None:
+    edge = Vector((top_end.x - top_start.x, top_end.y - top_start.y, 0.0))
+    if edge.length <= 1e-6:
+        return
+
+    edge.normalize()
+    if orientation_sign >= 0:
+        normal = Vector((edge.y, -edge.x, 0.0))
+    else:
+        normal = Vector((-edge.y, edge.x, 0.0))
+
+    segment_vertices = [
+        top_start + normal * start_half_thickness,
+        top_end + normal * end_half_thickness,
+        top_end - normal * end_half_thickness,
+        top_start - normal * start_half_thickness,
+        base_start + normal * base_start_half_thickness,
+        base_end + normal * base_end_half_thickness,
+        base_end - normal * base_end_half_thickness,
+        base_start - normal * base_start_half_thickness,
+    ]
+    start = len(vertices)
+    vertices.extend([(vertex.x, vertex.y, vertex.z) for vertex in segment_vertices])
+    faces.extend([
+        [start + 0, start + 1, start + 2, start + 3],
+        [start + 4, start + 7, start + 6, start + 5],
+        [start + 0, start + 4, start + 5, start + 1],
+        [start + 1, start + 5, start + 6, start + 2],
+        [start + 2, start + 6, start + 7, start + 3],
+        [start + 3, start + 7, start + 4, start + 0],
+    ])
+
+
+def append_loop_prism(vertices: List[Tuple[float, float, float]],
+                      faces: List[List[int]],
+                      top_loop: List[Vector],
+                      bottom_loop: List[Vector]) -> None:
+    if len(top_loop) < 3 or len(top_loop) != len(bottom_loop):
+        return
+
+    start = len(vertices)
+    vertices.extend([(vertex.x, vertex.y, vertex.z) for vertex in top_loop])
+    vertices.extend([(vertex.x, vertex.y, vertex.z) for vertex in bottom_loop])
+
+    count = len(top_loop)
+    faces.append([start + index for index in range(count)])
+    faces.append([start + count + index for index in reversed(range(count))])
+
+    for index in range(count):
+        next_index = (index + 1) % count
+        faces.append([
+            start + index,
+            start + next_index,
+            start + count + next_index,
+            start + count + index,
+        ])
+
+
+def get_fin_support_edges(vertices: List[Tuple[float, float, float]],
+                          faces: List[List[int]],
+                          contour_height: float) -> Tuple[Optional[Vector], List[Vector]]:
+    vertex_vectors = [Vector(vertex) for vertex in vertices]
+    if not vertex_vectors:
+        return None, []
+
+    bottom_index = min(
+        range(len(vertex_vectors)),
+        key=lambda index: (
+            vertex_vectors[index].z,
+            vertex_vectors[index].x * vertex_vectors[index].x + vertex_vectors[index].y * vertex_vectors[index].y,
+        ),
+    )
+    bottom_point = vertex_vectors[bottom_index]
+
+    neighbor_indices = set()
+    for face in faces:
+        if bottom_index not in face:
+            continue
+        count = len(face)
+        for index, vertex_index in enumerate(face):
+            if vertex_index != bottom_index:
+                continue
+            neighbor_indices.add(face[(index - 1) % count])
+            neighbor_indices.add(face[(index + 1) % count])
+
+    edge_points: List[Vector] = []
+    target_height = max(bottom_point.z + contour_height, bottom_point.z + 0.01)
+    for neighbor_index in neighbor_indices:
+        neighbor = vertex_vectors[neighbor_index]
+        if neighbor.z <= bottom_point.z + 1e-6:
+            continue
+        factor = min(max((target_height - bottom_point.z) / (neighbor.z - bottom_point.z), 0.0), 1.0)
+        edge_points.append(bottom_point.lerp(neighbor, factor))
+
+    if len(edge_points) < 3:
+        edge_points = [vertex_vectors[index] for index in neighbor_indices]
+
+    if len(edge_points) < 3:
+        return bottom_point, []
+
+    edge_points = dedupe_loop_points(edge_points)
+    edge_points.sort(key=lambda point: math.atan2(point.y - bottom_point.y, point.x - bottom_point.x))
+    return bottom_point, edge_points
+
+
+def get_fin_support_edge_limit(vertices: List[Tuple[float, float, float]],
+                               faces: List[List[int]]) -> float:
+    vertex_vectors = [Vector(vertex) for vertex in vertices]
+    if not vertex_vectors:
+        return 0.0
+
+    bottom_index = min(
+        range(len(vertex_vectors)),
+        key=lambda index: (
+            vertex_vectors[index].z,
+            vertex_vectors[index].x * vertex_vectors[index].x + vertex_vectors[index].y * vertex_vectors[index].y,
+        ),
+    )
+    bottom_point = vertex_vectors[bottom_index]
+
+    max_length = 0.0
+    for face in faces:
+        if bottom_index not in face:
+            continue
+        count = len(face)
+        for index, vertex_index in enumerate(face):
+            if vertex_index != bottom_index:
+                continue
+            for neighbor_index in (face[(index - 1) % count], face[(index + 1) % count]):
+                neighbor = vertex_vectors[neighbor_index]
+                max_length = max(max_length, (neighbor - bottom_point).length)
+
+    return max_length
+
+
+def generate_fin_supports(context,
+                          body_object: bpy.types.Object,
+                          mesh_vertices: List[Tuple[float, float, float]],
+                          mesh_faces: List[List[int]],
+                          settings_values: Dict[str, Any]) -> Optional[bpy.types.Object]:
+    clear_fin_support_artifacts(body_object)
+
+    if not settings_values.get("add_fin_supports", False):
+        return None
+
+    edge_limit = get_fin_support_edge_limit(mesh_vertices, mesh_faces)
+    contour_offset = max(settings_values.get("fin_support_contour_offset", 0.6), 0.05)
+    if edge_limit > 0:
+        contour_offset = min(contour_offset, edge_limit)
+    connection_thickness = max(settings_values.get("fin_support_connection_thickness", 0.5), 0.1)
+    fin_thickness = max(settings_values.get("fin_support_thickness", 2.0), 0.1)
+    fin_drop = max(settings_values.get("fin_support_drop", 6.0), 0.25)
+    raft_margin = max(settings_values.get("fin_support_raft_margin", 2.0), 0.0)
+    raft_thickness = max(settings_values.get("fin_support_raft_thickness", 1.2), 0.0)
+    raft_taper = max(settings_values.get("fin_support_raft_taper", 0.8), 0.0)
+
+    bottom_point, edge_points = get_fin_support_edges(mesh_vertices, mesh_faces, contour_offset)
+    if bottom_point is None or len(edge_points) < 3:
+        return None
+
+    mesh_center = sum((Vector(vertex) for vertex in mesh_vertices), Vector((0.0, 0.0, 0.0))) / len(mesh_vertices)
+
+    def body_overlap_point(point: Vector) -> Vector:
+        inward = mesh_center - point
+        if inward.length <= 1e-6:
+            return point.copy()
+        return point + inward.normalized() * FIN_SUPPORT_BODY_INTERSECTION
+
+    overlapped_bottom_point = body_overlap_point(bottom_point)
+    bottom_projection = Vector((overlapped_bottom_point.x, overlapped_bottom_point.y, 0.0))
+    raft_top_z = 0.0
+    raft_bottom_z = -raft_thickness
+    raft_seed = [Vector((point.x, point.y, raft_top_z)) for point in edge_points]
+    raft_loop = offset_convex_loop(raft_seed, raft_margin)
+    raft_bottom_loop = offset_convex_loop(raft_loop, -raft_taper) if raft_taper > 0 else [point.copy() for point in raft_loop]
+    if len(raft_bottom_loop) != len(raft_loop) or abs(polygon_area_xy(raft_bottom_loop)) <= 1e-6:
+        raft_bottom_loop = [point.copy() for point in raft_loop]
+
+    support_vertices: List[Tuple[float, float, float]] = []
+    support_faces: List[List[int]] = []
+    orientation_sign = 1.0 if polygon_area_xy(edge_points) >= 0 else -1.0
+    connection_half_thickness = connection_thickness * 0.5
+    edge_half_thickness = fin_thickness * 0.5
+
+    for edge_point in edge_points:
+        top_point = body_overlap_point(edge_point)
+        base_point = Vector((top_point.x, top_point.y, raft_top_z))
+        append_fin_segment(
+            support_vertices,
+            support_faces,
+            overlapped_bottom_point,
+            top_point,
+            bottom_projection,
+            base_point,
+            connection_half_thickness,
+            connection_half_thickness,
+            edge_half_thickness,
+            edge_half_thickness,
+            orientation_sign,
+        )
+
+    if raft_thickness > 0 and len(raft_loop) >= 3:
+        append_loop_prism(
+            support_vertices,
+            support_faces,
+            raft_loop,
+            [Vector((point.x, point.y, raft_bottom_z)) for point in raft_bottom_loop],
+        )
+
+    if not support_vertices or not support_faces:
+        return None
+
+    collection = body_object.users_collection[0] if body_object.users_collection else context.collection
+    support_name = f"{body_object.name}_fin_supports"
+    support_object = create_mesh_object(support_name, support_vertices, support_faces, collection)
+    support_object.parent = body_object
+    support_object.matrix_parent_inverse = Matrix.Identity(4)
+    support_object["dice_body_name"] = body_object.name
+    support_material = ensure_material("Dice Supports", (0.78, 0.88, 0.48, 1.0))
+    assign_material(support_object, support_material)
+    body_object[FIN_SUPPORT_OBJECT_KEY] = support_object.name
+    return support_object
 
 
 @contextmanager
@@ -2453,16 +3034,17 @@ def add_bar_indicator(context, mesh_object: bpy.types.Object, font_size: float,
 def create_numbers(context, numbers, locations, rotations, font_path, font_size, number_depth, number_indicator_type,
                    period_indicator_scale, period_indicator_space, bar_indicator_height, bar_indicator_width,
                    bar_indicator_space, center_bar, custom_image_face=0, custom_image_path='',
-                   custom_image_scale=1):
+                   custom_image_scale=1, original_indices=None):
     number_objs = []
     # create the number meshes
     for i in range(len(locations)):
+        index_value = original_indices[i] if original_indices and i < len(original_indices) else i
         number_object = create_number(context, numbers[i], font_path, font_size, number_depth, locations[i],
                                       rotations[i], number_indicator_type, period_indicator_scale,
                                       period_indicator_space, bar_indicator_height, bar_indicator_width,
                                       bar_indicator_space, center_bar,
                                       custom_image_face=custom_image_face, custom_image_path=custom_image_path,
-                                      custom_image_scale=custom_image_scale, index=i)
+                                      custom_image_scale=custom_image_scale, index=index_value)
         number_objs.append(number_object)
 
     # join the numbers into a single object
@@ -2523,6 +3105,560 @@ def create_number(context, number, font_path, font_size, number_depth, location,
     return mesh_object
 
 
+def supports_number_indicators(dice_type: str, num_faces: int) -> bool:
+    return dice_type in ['D6', 'D8', 'D10', 'D12', 'D20', 'D100'] or (
+        dice_type == 'CUSTOM_TRAP' and num_faces >= 9
+    ) or (
+        dice_type in ['CUSTOM_CRYSTAL', 'CUSTOM_SHARD', 'CUSTOM_BIPYRAMID'] and num_faces >= 6
+    )
+
+
+def _polygon_area_2d(points: List[Vector]) -> float:
+    area = 0.0
+    count = len(points)
+    for i in range(count):
+        p1 = points[i]
+        p2 = points[(i + 1) % count]
+        area += (p1.x * p2.y) - (p2.x * p1.y)
+    return area * 0.5
+
+
+def _cross_2d(a: Vector, b: Vector) -> float:
+    return a.x * b.y - a.y * b.x
+
+
+def _line_intersection_2d(p1: Vector, d1: Vector, p2: Vector, d2: Vector) -> Optional[Vector]:
+    denom = _cross_2d(d1, d2)
+    if abs(denom) < 1e-9:
+        return None
+
+    diff = p2 - p1
+    t = _cross_2d(diff, d2) / denom
+    return p1 + d1 * t
+
+
+def _inset_convex_polygon_2d(points: List[Vector], inset: float) -> Optional[List[Vector]]:
+    if len(points) < 3:
+        return None
+
+    points_2d = [Vector((p.x, p.y)) for p in points]
+    if _polygon_area_2d(points_2d) < 0:
+        points_2d.reverse()
+
+    inset_points: List[Vector] = []
+    count = len(points_2d)
+
+    for i in range(count):
+        prev_point = points_2d[(i - 1) % count]
+        current_point = points_2d[i]
+        next_point = points_2d[(i + 1) % count]
+
+        prev_edge = current_point - prev_point
+        next_edge = next_point - current_point
+
+        if prev_edge.length < 1e-8 or next_edge.length < 1e-8:
+            return None
+
+        prev_dir = prev_edge.normalized()
+        next_dir = next_edge.normalized()
+
+        prev_normal = Vector((-prev_dir.y, prev_dir.x))
+        next_normal = Vector((-next_dir.y, next_dir.x))
+
+        prev_shifted = current_point + prev_normal * inset
+        next_shifted = current_point + next_normal * inset
+
+        intersection = _line_intersection_2d(prev_shifted, prev_dir, next_shifted, next_dir)
+        if intersection is None:
+            bisector = prev_normal + next_normal
+            if bisector.length < 1e-8:
+                return None
+            bisector.normalize()
+            denom = bisector.dot(prev_normal)
+            if abs(denom) < 1e-8:
+                return None
+            intersection = current_point + bisector * (inset / denom)
+
+        inset_points.append(intersection)
+
+    if abs(_polygon_area_2d(inset_points)) < 1e-6:
+        return None
+
+    return inset_points
+
+
+def _append_face_prism(vertices_out: List[Tuple[float, float, float]],
+                       faces_out: List[List[int]],
+                       polygon_2d: List[Vector],
+                       center: Vector,
+                       face_right: Vector,
+                       face_up: Vector,
+                       face_normal: Vector,
+                       top_offset: float,
+                       bottom_offset: float) -> None:
+    count = len(polygon_2d)
+    base_index = len(vertices_out)
+
+    for point in polygon_2d:
+        base_3d = center + face_right * point.x + face_up * point.y
+        top_vertex = base_3d + (face_normal * top_offset)
+        vertices_out.append((top_vertex.x, top_vertex.y, top_vertex.z))
+
+    for point in polygon_2d:
+        base_3d = center + face_right * point.x + face_up * point.y
+        bottom_vertex = base_3d + (face_normal * bottom_offset)
+        vertices_out.append((bottom_vertex.x, bottom_vertex.y, bottom_vertex.z))
+
+    top_face = [base_index + i for i in range(count)]
+    bottom_face = [base_index + count + i for i in range(count)]
+    faces_out.append(top_face)
+    faces_out.append(list(reversed(bottom_face)))
+
+    for i in range(count):
+        next_i = (i + 1) % count
+        faces_out.append([
+            base_index + i,
+            base_index + next_i,
+            base_index + count + next_i,
+            base_index + count + i
+        ])
+
+
+def create_face_panels(context,
+                       source_vertices: List[Tuple[float, float, float]],
+                       source_faces: List[List[int]],
+                       panel_edge_inset: float,
+                       panel_tolerance: float,
+                       panel_thickness: float,
+                       panel_recess_depth: float,
+                       skip_face_index: int = 0) -> Tuple[Optional[bpy.types.Object], Optional[bpy.types.Object]]:
+    if not source_vertices or not source_faces:
+        return None, None
+
+    panel_vertices: List[Tuple[float, float, float]] = []
+    panel_faces: List[List[int]] = []
+    cutter_vertices: List[Tuple[float, float, float]] = []
+    cutter_faces: List[List[int]] = []
+
+    vectors = [Vector(v) for v in source_vertices]
+
+    safe_tolerance = max(panel_tolerance, 0.0)
+    safe_recess_depth = max(panel_recess_depth, 0.05)
+    safe_thickness = max(min(panel_thickness, safe_recess_depth), 0.05)
+    panel_top_inset = safe_recess_depth - safe_thickness
+    panel_inset = max(panel_edge_inset + safe_tolerance, 0.01)
+    pocket_inset = max(panel_edge_inset, 0.01)
+    pocket_depth = safe_recess_depth + safe_tolerance
+
+    for face_idx, face in enumerate(source_faces, start=1):
+        if skip_face_index and face_idx == skip_face_index:
+            continue
+
+        if len(face) < 3:
+            continue
+
+        face_vertices = [vectors[index] for index in face]
+        center = sum(face_vertices, Vector((0, 0, 0))) / len(face_vertices)
+
+        normal = (face_vertices[1] - face_vertices[0]).cross(face_vertices[2] - face_vertices[0])
+        if normal.length < 1e-8:
+            continue
+
+        normal.normalize()
+        if normal.dot(center) < 0:
+            normal = -normal
+
+        right = face_vertices[1] - face_vertices[0]
+        right -= normal * right.dot(normal)
+        if right.length < 1e-8:
+            right = face_vertices[2] - face_vertices[0]
+            right -= normal * right.dot(normal)
+        if right.length < 1e-8:
+            continue
+        right.normalize()
+
+        up = normal.cross(right)
+        if up.length < 1e-8:
+            continue
+        up.normalize()
+
+        face_2d = []
+        for vert in face_vertices:
+            local = vert - center
+            face_2d.append(Vector((local.dot(right), local.dot(up))))
+
+        pocket_poly = _inset_convex_polygon_2d(face_2d, pocket_inset)
+        panel_poly = _inset_convex_polygon_2d(face_2d, panel_inset)
+        if pocket_poly is None or panel_poly is None:
+            continue
+
+        _append_face_prism(
+            panel_vertices,
+            panel_faces,
+            panel_poly,
+            center,
+            right,
+            up,
+            normal,
+            -panel_top_inset,
+            -(panel_top_inset + safe_thickness),
+        )
+
+        _append_face_prism(
+            cutter_vertices,
+            cutter_faces,
+            pocket_poly,
+            center,
+            right,
+            up,
+            normal,
+            0.05,
+            -pocket_depth,
+        )
+
+    if not panel_faces or not cutter_faces:
+        return None, None
+
+    panel_object = create_mesh(context, panel_vertices, panel_faces, "dice_face_panels")
+    panel_object.matrix_world = Matrix()
+    panel_material = ensure_material("Dice Panels", (0.95, 0.95, 0.95, 1))
+    assign_material(panel_object, panel_material)
+
+    cutter_object = create_mesh(context, cutter_vertices, cutter_faces, "dice_panel_cutter")
+    cutter_object.matrix_world = Matrix()
+    cutter_object.display_type = 'WIRE'
+    cutter_object.hide_render = True
+    cutter_object.hide_set(True)
+
+    return panel_object, cutter_object
+
+
+def offset_number_locations_for_panels(locations: List[Tuple[float, float, float]],
+                                       rotations: List[Tuple[float, float, float]],
+                                       panel_thickness: float,
+                                       panel_recess_depth: float) -> List[Tuple[float, float, float]]:
+    safe_recess_depth = max(panel_recess_depth, 0.0)
+    safe_thickness = max(min(panel_thickness, safe_recess_depth), 0.0)
+    inset_distance = (safe_recess_depth - safe_thickness) + (safe_thickness * 0.5)
+
+    shifted_locations: List[Tuple[float, float, float]] = []
+
+    for location, rotation in zip(locations, rotations):
+        loc_vec = Vector(location)
+        normal = Euler(rotation, 'XYZ').to_matrix() @ Vector((0, 0, 1))
+        if normal.length < 1e-8:
+            normal = loc_vec.normalized() if loc_vec.length > 1e-8 else Vector((0, 0, 1))
+        else:
+            normal.normalize()
+
+        if loc_vec.length > 1e-8 and normal.dot(loc_vec) < 0:
+            normal = -normal
+
+        shifted = loc_vec - normal * inset_distance
+        shifted_locations.append((shifted.x, shifted.y, shifted.z))
+
+    return shifted_locations
+
+
+def _parse_face_value(value_text: str) -> Optional[int]:
+    text = str(value_text).strip()
+    cleaned = re.sub(r"[^0-9\-]", "", text)
+    if cleaned in ("", "-"):
+        return None
+    try:
+        return int(cleaned)
+    except ValueError:
+        return None
+
+
+def get_number_face_indices(mesh: Mesh) -> List[int]:
+    numbers = mesh.get_numbers()
+    locations = mesh.get_number_locations()
+    faces = mesh.faces or []
+    vertices = mesh.vertices or []
+
+    if not numbers or not locations or not faces or not vertices:
+        return []
+
+    vectors = [Vector(v) for v in vertices]
+    face_frames: List[Tuple[int, Vector, Vector]] = []
+
+    for face_idx, face in enumerate(faces, start=1):
+        if len(face) < 3:
+            continue
+
+        face_vertices = [vectors[idx] for idx in face]
+        center = sum(face_vertices, Vector((0, 0, 0))) / len(face_vertices)
+
+        normal = (face_vertices[1] - face_vertices[0]).cross(face_vertices[2] - face_vertices[0])
+        if normal.length < 1e-8:
+            continue
+
+        normal.normalize()
+        # Keep a stable outward-ish normal for distance tests.
+        if center.length > 1e-8 and normal.dot(center) < 0:
+            normal = -normal
+
+        face_frames.append((face_idx, center, normal))
+
+    if not face_frames:
+        return []
+
+    mapping: List[int] = []
+
+    for location in locations:
+        loc_vec = Vector(location)
+        best_face_idx = 0
+        best_plane_distance = float("inf")
+        best_center_distance = float("inf")
+
+        for face_idx, center, normal in face_frames:
+            plane_distance = abs((loc_vec - center).dot(normal))
+            center_distance = (loc_vec - center).length
+
+            if (
+                plane_distance < best_plane_distance - 1e-6
+                or (
+                    abs(plane_distance - best_plane_distance) <= 1e-6
+                    and center_distance < best_center_distance
+                )
+            ):
+                best_plane_distance = plane_distance
+                best_center_distance = center_distance
+                best_face_idx = face_idx
+
+        mapping.append(best_face_idx)
+
+    return mapping
+
+
+def get_number_indices_for_face(mesh: Mesh, face_index: int) -> List[int]:
+    if face_index <= 0:
+        return []
+
+    mapped_faces = get_number_face_indices(mesh)
+    if mapped_faces:
+        return [idx for idx, mapped_face in enumerate(mapped_faces) if mapped_face == face_index]
+
+    numbers_count = len(mesh.get_numbers())
+    face_count = len(mesh.faces) if mesh.faces else 0
+    if numbers_count <= 0 or face_count <= 0:
+        return []
+
+    face_zero = face_index - 1
+    if face_zero < 0 or face_zero >= face_count:
+        return []
+
+    if numbers_count == face_count:
+        return [face_zero]
+
+    if numbers_count % face_count == 0:
+        per_face = numbers_count // face_count
+        start = face_zero * per_face
+        return list(range(start, min(start + per_face, numbers_count)))
+
+    return [min(face_zero, numbers_count - 1)]
+
+
+def get_highest_value_face_index(mesh: Mesh) -> int:
+    numbers = mesh.get_numbers()
+    if not numbers or not mesh.faces:
+        return 0
+
+    number_face_map = get_number_face_indices(mesh)
+    if len(number_face_map) < len(numbers):
+        number_face_map = number_face_map + [0] * (len(numbers) - len(number_face_map))
+
+    best_face = 0
+    best_value = float("-inf")
+    fallback_face = len(mesh.faces) if mesh.faces else 0
+
+    for number_idx, number_text in enumerate(numbers):
+        parsed_value = _parse_face_value(number_text)
+        if parsed_value is None:
+            continue
+
+        face_idx = number_face_map[number_idx] if number_idx < len(number_face_map) else 0
+        if face_idx <= 0:
+            face_idx = min(number_idx + 1, fallback_face if fallback_face > 0 else number_idx + 1)
+
+        if parsed_value > best_value:
+            best_value = parsed_value
+            best_face = face_idx
+
+    return best_face
+
+
+def create_numbers_object_for_mesh(context,
+                                   mesh: Mesh,
+                                   size: float,
+                                   number_scale: float,
+                                   number_depth: float,
+                                   font_path: str,
+                                   number_indicator_type: str = NUMBER_IND_NONE,
+                                   period_indicator_scale: float = 1,
+                                   period_indicator_space: float = 1,
+                                   bar_indicator_height: float = 1,
+                                   bar_indicator_width: float = 1,
+                                   bar_indicator_space: float = 1,
+                                   center_bar: bool = True,
+                                   custom_image_face: int = 0,
+                                   custom_image_path: str = '',
+                                   custom_image_scale: float = 1,
+                                   location_override: Optional[List[Tuple[float, float, float]]] = None,
+                                   include_indices: Optional[List[int]] = None) -> Optional[bpy.types.Object]:
+    all_numbers = mesh.get_numbers()
+    if location_override is not None:
+        all_locations = location_override
+    else:
+        all_locations = mesh.transform_number_locations(mesh.get_number_locations())
+    all_rotations = mesh.transform_number_rotations(mesh.get_number_rotations())
+
+    if len(all_numbers) != len(all_locations) or len(all_numbers) != len(all_rotations):
+        return None
+
+    if include_indices is None:
+        indices = list(range(len(all_numbers)))
+    else:
+        indices = [
+            idx for idx in include_indices
+            if 0 <= idx < len(all_numbers) and idx < len(all_locations) and idx < len(all_rotations)
+        ]
+
+    if not indices:
+        return None
+
+    numbers = [all_numbers[idx] for idx in indices]
+    locations = [all_locations[idx] for idx in indices]
+    rotations = [all_rotations[idx] for idx in indices]
+
+    font_size = mesh.base_font_scale * size * number_scale
+    return create_numbers(
+        context,
+        numbers,
+        locations,
+        rotations,
+        font_path,
+        font_size,
+        number_depth,
+        number_indicator_type,
+        period_indicator_scale,
+        period_indicator_space,
+        bar_indicator_height,
+        bar_indicator_width,
+        bar_indicator_space,
+        center_bar,
+        custom_image_face=custom_image_face,
+        custom_image_path=custom_image_path,
+        custom_image_scale=custom_image_scale,
+        original_indices=indices,
+    )
+
+
+def create_panel_number_cutters(context,
+                                mesh: Mesh,
+                                size: float,
+                                number_scale: float,
+                                panel_thickness: float,
+                                panel_recess_depth: float,
+                                font_path: str,
+                                number_indicator_type: str = NUMBER_IND_NONE,
+                                period_indicator_scale: float = 1,
+                                period_indicator_space: float = 1,
+                                bar_indicator_height: float = 1,
+                                bar_indicator_width: float = 1,
+                                bar_indicator_space: float = 1,
+                                center_bar: bool = True,
+                                custom_image_face: int = 0,
+                                custom_image_path: str = '',
+                                custom_image_scale: float = 1,
+                                exclude_face_index: int = 0) -> Optional[bpy.types.Object]:
+    rotations = mesh.transform_number_rotations(mesh.get_number_rotations())
+    shifted_locations = offset_number_locations_for_panels(
+        mesh.transform_number_locations(mesh.get_number_locations()),
+        rotations,
+        panel_thickness,
+        panel_recess_depth,
+    )
+
+    cutter_depth = max(panel_thickness + 0.4, 0.6)
+    exclude_indices = set(get_number_indices_for_face(mesh, exclude_face_index))
+    include_indices = [
+        idx for idx in range(len(mesh.get_numbers()))
+        if idx not in exclude_indices
+    ]
+
+    return create_numbers_object_for_mesh(
+        context,
+        mesh,
+        size,
+        number_scale,
+        cutter_depth,
+        font_path,
+        number_indicator_type,
+        period_indicator_scale,
+        period_indicator_space,
+        bar_indicator_height,
+        bar_indicator_width,
+        bar_indicator_space,
+        center_bar,
+        custom_image_face=custom_image_face,
+        custom_image_path=custom_image_path,
+        custom_image_scale=custom_image_scale,
+        location_override=shifted_locations,
+        include_indices=include_indices,
+    )
+
+
+def create_top_face_direct_cutter(context,
+                                  mesh: Mesh,
+                                  top_face_index: int,
+                                  size: float,
+                                  number_scale: float,
+                                  depth: float,
+                                  scale_multiplier: float,
+                                  font_path: str,
+                                  number_indicator_type: str = NUMBER_IND_NONE,
+                                  period_indicator_scale: float = 1,
+                                  period_indicator_space: float = 1,
+                                  bar_indicator_height: float = 1,
+                                  bar_indicator_width: float = 1,
+                                  bar_indicator_space: float = 1,
+                                  center_bar: bool = True,
+                                  custom_image_path: str = '',
+                                  custom_image_scale: float = 1) -> Optional[bpy.types.Object]:
+    if top_face_index <= 0:
+        return None
+
+    top_face_number_indices = get_number_indices_for_face(mesh, top_face_index)
+    if not top_face_number_indices:
+        return None
+
+    depth_value = max(depth, 0.1)
+    scaled_number_scale = max(number_scale * scale_multiplier, 0.05)
+    forced_custom_face = (top_face_number_indices[0] + 1) if custom_image_path else 0
+
+    return create_numbers_object_for_mesh(
+        context,
+        mesh,
+        size,
+        scaled_number_scale,
+        depth_value,
+        font_path,
+        number_indicator_type,
+        period_indicator_scale,
+        period_indicator_space,
+        bar_indicator_height,
+        bar_indicator_width,
+        bar_indicator_space,
+        center_bar,
+        custom_image_face=forced_custom_face,
+        custom_image_path=custom_image_path,
+        custom_image_scale=custom_image_scale,
+        include_indices=top_face_number_indices,
+    )
+
+
 def execute_generator(op, context, mesh_cls, name: str, **kwargs) -> Dict[str, str]:
     """
     Main execution function for dice generation operators.
@@ -2550,6 +3686,7 @@ def execute_generator(op, context, mesh_cls, name: str, **kwargs) -> Dict[str, s
 
     # create the cube mesh
     die = mesh_cls("dice_body", op.size, **kwargs)
+    die.apply_print_layout(getattr(op, "fin_support_drop", 0.0) if getattr(op, "add_fin_supports", False) else 0.0)
     die_obj = die.create(context)
     configure_dice_finish_modifier(die_obj, op.dice_finish, getattr(op, "bumper_scale", 1))
     body_material = ensure_material("Dice Body", (0.95, 0.95, 0.9, 1))
@@ -2623,6 +3760,100 @@ def BumperScaleProperty():
         soft_max=5,
         default=1,
     )
+
+
+AddFinSupportsProperty = BoolProperty(
+    name='Generate Fin Supports',
+    description='Create contour-style fin supports for resin printing',
+    default=False
+)
+
+
+FinSupportContourOffsetProperty = FloatProperty(
+    name='Fin Edge Height',
+    description='How far up the point-down support edges the fins should climb',
+    min=0.05,
+    soft_min=0.05,
+    soft_max=30,
+    default=6.0
+)
+
+
+FinSupportThicknessProperty = FloatProperty(
+    name='Bottom Edge Thickness',
+    description='Thickness of the fin where it meets the raft',
+    min=0.1,
+    soft_min=0.1,
+    max=5,
+    soft_max=5,
+    default=2.0
+)
+
+
+FinSupportConnectionThicknessProperty = FloatProperty(
+    name='Top Edge Thickness',
+    description='Thickness of the fin where it intersects the die edge',
+    min=0.1,
+    soft_min=0.1,
+    max=5,
+    soft_max=5,
+    default=0.5
+)
+
+
+FinSupportFlareProperty = FloatProperty(
+    name='Fin Base Flare',
+    description='Additional wall width added at the raft end of each fin',
+    min=0.0,
+    soft_min=0.0,
+    max=5,
+    soft_max=2,
+    default=0.8
+)
+
+
+FinSupportDropProperty = FloatProperty(
+    name='Fin Drop',
+    description='Vertical drop from the die to the fin raft',
+    min=0.25,
+    soft_min=0.25,
+    max=30,
+    soft_max=15,
+    default=6.0
+)
+
+
+FinSupportRaftMarginProperty = FloatProperty(
+    name='Raft Margin',
+    description='Outward offset applied to the fin raft footprint',
+    min=0.0,
+    soft_min=0.0,
+    max=10,
+    soft_max=5,
+    default=2.0
+)
+
+
+FinSupportRaftThicknessProperty = FloatProperty(
+    name='Raft Thickness',
+    description='Thickness of the fin support raft',
+    min=0.0,
+    soft_min=0.0,
+    max=10,
+    soft_max=4,
+    default=1.2
+)
+
+
+FinSupportRaftTaperProperty = FloatProperty(
+    name='Raft Taper',
+    description='Amount the raft narrows toward the build plate for easier removal',
+    min=0.0,
+    soft_min=0.0,
+    max=10,
+    soft_max=4,
+    default=0.8
+)
 
 
 AddNumbersProperty = BoolProperty(
@@ -2769,6 +4000,79 @@ def NumberVOffsetProperty(default: float): return FloatProperty(
 )
 
 
+UseFacePanelsProperty = BoolProperty(
+    name='Create Face Panels',
+    description='Generate inset face pockets and separate printable panel inserts',
+    default=False
+)
+
+PanelEdgeInsetProperty = FloatProperty(
+    name='Panel Edge Inset',
+    description='Distance from the original face edge to panel edge (mm)',
+    min=0.1,
+    soft_min=0.1,
+    max=10,
+    soft_max=10,
+    default=2.0
+)
+
+PanelToleranceProperty = FloatProperty(
+    name='Panel Tolerance',
+    description='Extra clearance between panel and pocket walls (mm)',
+    min=0.0,
+    soft_min=0.0,
+    max=0.5,
+    soft_max=0.5,
+    default=0.15
+)
+
+PanelThicknessProperty = FloatProperty(
+    name='Panel Thickness',
+    description='Thickness of printed face panels (mm)',
+    min=0.2,
+    soft_min=0.2,
+    max=6,
+    soft_max=6,
+    default=1.2
+)
+
+PanelRecessDepthProperty = FloatProperty(
+    name='Panel Recess Depth',
+    description='Depth of recessed panel pockets in the die body (mm)',
+    min=0.2,
+    soft_min=0.2,
+    max=8,
+    soft_max=8,
+    default=1.6
+)
+
+PanelTopFaceFlushProperty = BoolProperty(
+    name='Flush Highest Value Face',
+    description='Leave the highest face value flush (no panel) and engrave directly into the body',
+    default=False
+)
+
+PanelTopFaceScaleProperty = FloatProperty(
+    name='Highest Value Face Scale',
+    description='Scale multiplier for engraving on the highest value flush face',
+    min=0.1,
+    soft_min=0.1,
+    max=5,
+    soft_max=5,
+    default=1.0
+)
+
+PanelTopFaceDepthProperty = FloatProperty(
+    name='Highest Value Face Depth',
+    description='Engraving depth for the highest value flush face (mm)',
+    min=0.1,
+    soft_min=0.1,
+    max=5,
+    soft_max=5,
+    default=0.9
+)
+
+
 class DiceGenSettings(bpy.types.PropertyGroup):
     size: FloatProperty(
         name="Dice Size",
@@ -2795,6 +4099,22 @@ class DiceGenSettings(bpy.types.PropertyGroup):
     number_scale: NumberScaleProperty
 
     number_depth: NumberDepthProperty
+
+    add_fin_supports: AddFinSupportsProperty
+
+    fin_support_contour_offset: FinSupportContourOffsetProperty
+
+    fin_support_connection_thickness: FinSupportConnectionThicknessProperty
+
+    fin_support_thickness: FinSupportThicknessProperty
+
+    fin_support_drop: FinSupportDropProperty
+
+    fin_support_raft_margin: FinSupportRaftMarginProperty
+
+    fin_support_raft_thickness: FinSupportRaftThicknessProperty
+
+    fin_support_raft_taper: FinSupportRaftTaperProperty
 
 
     add_numbers: AddNumbersProperty
@@ -2938,14 +4258,14 @@ class OBJECT_OT_dice_gen_update(bpy.types.Operator):
             self.report({'ERROR'}, "Object is not a generated die")
             return {'CANCELLED'}
 
-        original_modifiers = set(body_obj.modifiers)
-
         mesh_cls_map = {
             "Tetrahedron": Tetrahedron,
             "D4Crystal": D4Crystal,
             "D4Shard": D4Shard,
             "CustomCrystal": CustomCrystal,
             "CustomShard": CustomShard,
+            "CustomBipyramid": CustomBipyramid,
+            "CustomTrapezohedron": CustomTrapezohedron,
             "Cube": Cube,
             "Octahedron": Octahedron,
             "Dodecahedron": Dodecahedron,
@@ -2962,11 +4282,34 @@ class OBJECT_OT_dice_gen_update(bpy.types.Operator):
         size = settings_values["size"]
 
         if die_type == "Tetrahedron":
-            die = mesh_cls(body_obj.name, size, settings_values["number_center_offset"])
+            die = mesh_cls(
+                body_obj.name,
+                size,
+                settings_values["number_center_offset"],
+                settings_values["number_h_offset"],
+                settings_values["number_v_offset"],
+            )
         elif die_type == "D4Crystal":
-            die = mesh_cls(body_obj.name, size, settings_values["base_height"], settings_values["top_point_height"], settings_values["bottom_point_height"])
+            die = mesh_cls(
+                body_obj.name,
+                size,
+                settings_values["base_height"],
+                settings_values["top_point_height"],
+                settings_values["bottom_point_height"],
+                settings_values["number_h_offset"],
+                settings_values["number_v_offset"],
+            )
         elif die_type == "CustomCrystal":
-            die = mesh_cls(body_obj.name, size, settings_values["num_faces"], settings_values["base_height"], settings_values["top_point_height"], settings_values["bottom_point_height"])
+            die = mesh_cls(
+                body_obj.name,
+                size,
+                settings_values["num_faces"],
+                settings_values["base_height"],
+                settings_values["top_point_height"],
+                settings_values["bottom_point_height"],
+                settings_values["number_h_offset"],
+                settings_values["number_v_offset"],
+            )
         elif die_type == "D4Shard":
             die = mesh_cls(
                 body_obj.name,
@@ -2974,6 +4317,7 @@ class OBJECT_OT_dice_gen_update(bpy.types.Operator):
                 settings_values["top_point_height"],
                 settings_values["bottom_point_height"],
                 settings_values["number_v_offset"],
+                settings_values["number_h_offset"],
             )
         elif die_type == "CustomShard":
             die = mesh_cls(
@@ -2983,12 +4327,58 @@ class OBJECT_OT_dice_gen_update(bpy.types.Operator):
                 settings_values["top_point_height"],
                 settings_values["bottom_point_height"],
                 settings_values["number_v_offset"],
+                settings_values["number_h_offset"],
+            )
+        elif die_type == "CustomBipyramid":
+            die = mesh_cls(
+                body_obj.name,
+                size,
+                settings_values["num_faces"],
+                settings_values["top_point_height"],
+                settings_values["bottom_point_height"],
+                settings_values["number_h_offset"],
+                settings_values["number_v_offset"],
+            )
+        elif die_type == "CustomTrapezohedron":
+            die = mesh_cls(
+                body_obj.name,
+                size,
+                settings_values["num_faces"],
+                settings_values["height"],
+                settings_values["number_v_offset"],
+                settings_values["number_h_offset"],
             )
         elif die_type in ("D10Mesh", "D100Mesh"):
-            die = mesh_cls(body_obj.name, size, settings_values["height"], settings_values["number_v_offset"])
+            die = mesh_cls(
+                body_obj.name,
+                size,
+                settings_values["height"],
+                settings_values["number_v_offset"],
+                settings_values["number_h_offset"],
+            )
         else:
-            die = mesh_cls(body_obj.name, size)
+            die = mesh_cls(body_obj.name, size, settings_values["number_h_offset"], settings_values["number_v_offset"])
 
+        die.apply_print_layout(settings_values["fin_support_drop"] if settings_values.get("add_fin_supports") else 0.0)
+
+        font_path = validate_font_path(settings_values["font_path"]) if settings_values["font_path"] else ""
+        custom_image_path = validate_svg_path(settings_values["custom_image_path"]) if settings_values["custom_image_path"] else ""
+        settings_values["font_path"] = font_path
+        settings_values["custom_image_path"] = custom_image_path
+
+        old_numbers_name = body_obj.get("dice_numbers_name")
+        if settings_owner.get("dice_body_name"):
+            old_numbers_name = settings_owner.name
+
+        remove_modifier_if_exists(body_obj, 'boolean')
+        if "dice_numbers_name" in body_obj:
+            del body_obj["dice_numbers_name"]
+        if old_numbers_name and old_numbers_name != body_obj.name:
+            remove_object_if_exists(old_numbers_name)
+
+        clear_panel_artifacts(body_obj)
+        clear_fin_support_artifacts(body_obj)
+        rebuild_mesh_object(body_obj, die.get_output_vertices(), die.faces)
         die.dice_mesh = body_obj
         configure_dice_finish_modifier(
             body_obj,
@@ -2996,82 +4386,57 @@ class OBJECT_OT_dice_gen_update(bpy.types.Operator):
             settings_values.get("bumper_scale", 1),
         )
 
-        font_path = validate_font_path(settings_values["font_path"]) if settings_values["font_path"] else ""
-        custom_image_path = validate_svg_path(settings_values["custom_image_path"]) if settings_values["custom_image_path"] else ""
-        settings_values["custom_image_path"] = custom_image_path
+        indicator_type = NUMBER_IND_NONE
+        if supports_number_indicators(die_type, settings_values["num_faces"]):
+            indicator_type = settings_values["number_indicator_type"]
 
         new_numbers_obj = None
-
         if settings_values["add_numbers"]:
-            try:
-                if settings_values["number_indicator_type"] != NUMBER_IND_NONE:
-                    new_numbers_obj = die.create_numbers(
-                        context,
-                        size,
-                        settings_values["number_scale"],
-                        settings_values["number_depth"],
-                        font_path,
-                        settings_values["number_indicator_type"],
-                        settings_values["period_indicator_scale"],
-                        settings_values["period_indicator_space"],
-                        settings_values["bar_indicator_height"],
-                        settings_values["bar_indicator_width"],
-                        settings_values["bar_indicator_space"],
-                        settings_values["center_bar"],
-                        settings_values["custom_image_face"],
-                        custom_image_path,
-                        settings_values["custom_image_scale"],
-                    )
-                else:
-                    new_numbers_obj = die.create_numbers(
-                        context,
-                        size,
-                        settings_values["number_scale"],
-                        settings_values["number_depth"],
-                        font_path,
-                        custom_image_face=settings_values["custom_image_face"],
-                        custom_image_path=custom_image_path,
-                        custom_image_scale=settings_values["custom_image_scale"],
-                    )
-            except Exception as exc:
-                self.report({'ERROR'}, f"Failed to regenerate numbers: {exc}")
-                return {'CANCELLED'}
-        else:
-            for mod in list(original_modifiers):
-                if mod.type == 'BOOLEAN' and mod.name == 'boolean':
-                    body_obj.modifiers.remove(mod)
+            new_numbers_obj = create_numbers_object_for_mesh(
+                context,
+                die,
+                size,
+                settings_values["number_scale"],
+                settings_values["number_depth"],
+                font_path,
+                indicator_type,
+                settings_values["period_indicator_scale"],
+                settings_values["period_indicator_space"],
+                settings_values["bar_indicator_height"],
+                settings_values["bar_indicator_width"],
+                settings_values["bar_indicator_space"],
+                settings_values["center_bar"],
+                settings_values["custom_image_face"],
+                custom_image_path,
+                settings_values["custom_image_scale"],
+            )
 
-            if numbers_obj and numbers_obj.name in bpy.data.objects:
-                bpy.data.objects.remove(numbers_obj, do_unlink=True)
+            if new_numbers_obj is not None:
+                new_numbers_obj.name = "dice_numbers"
+                apply_boolean_modifier(body_obj, new_numbers_obj)
+                new_numbers_obj["dice_body_name"] = body_obj.name
+                new_numbers_obj["dice_gen_type"] = die_type
+                apply_settings(new_numbers_obj.dice_gen_settings, settings_values)
 
-            if "dice_numbers_name" in body_obj:
-                del body_obj["dice_numbers_name"]
+        fin_support_object = generate_fin_supports(
+            context,
+            body_obj,
+            die.get_output_vertices(),
+            die.faces,
+            settings_values,
+        )
+        if settings_values.get("add_fin_supports") and fin_support_object is None:
+            self.report({'WARNING'}, "Could not regenerate fin supports for this die.")
 
-            body_obj["dice_gen_type"] = die_type
-            apply_settings(body_obj.dice_gen_settings, settings_values)
-            return {'FINISHED'}
+        body_obj["dice_gen_type"] = die_type
+        apply_settings(body_obj.dice_gen_settings, settings_values)
 
-        if new_numbers_obj is not None:
-            desired_name = numbers_obj.name if numbers_obj else "dice_numbers"
-            if numbers_obj and numbers_obj.name in bpy.data.objects:
-                numbers_obj.name = f"{numbers_obj.name}_old"
-
-            for mod in list(original_modifiers):
-                if mod.type == 'BOOLEAN' and mod.name == 'boolean':
-                    body_obj.modifiers.remove(mod)
-
-            new_numbers_obj["dice_body_name"] = body_obj.name
-            new_numbers_obj["dice_gen_type"] = die_type
-            apply_settings(new_numbers_obj.dice_gen_settings, settings_values)
-
-            new_numbers_obj.name = desired_name
-            body_obj["dice_numbers_name"] = new_numbers_obj.name
-
-            if numbers_obj and numbers_obj.name in bpy.data.objects:
-                bpy.data.objects.remove(numbers_obj, do_unlink=True)
-        else:
-            body_obj["dice_gen_type"] = die_type
-            apply_settings(body_obj.dice_gen_settings, settings_values)
+        target_collection = body_obj.users_collection[0] if body_obj.users_collection else context.scene.collection
+        organize_dice_objects_in_collection(
+            body_obj,
+            target_collection,
+            extra_objects=[new_numbers_obj, fin_support_object],
+        )
 
         return {'FINISHED'}
 
@@ -3116,6 +4481,18 @@ class OBJECT_PT_dice_gen(bpy.types.Panel):
         row.enabled = bool(settings.custom_image_path)
         row.prop(settings, "custom_image_face")
         row.prop(settings, "custom_image_scale")
+
+        box = layout.box()
+        box.label(text="Fin Supports", icon='MOD_SOLIDIFY')
+        box.prop(settings, "add_fin_supports")
+        if settings.add_fin_supports:
+            box.prop(settings, "fin_support_contour_offset")
+            box.prop(settings, "fin_support_connection_thickness")
+            box.prop(settings, "fin_support_thickness")
+            box.prop(settings, "fin_support_drop")
+            box.prop(settings, "fin_support_raft_margin")
+            box.prop(settings, "fin_support_raft_thickness")
+            box.prop(settings, "fin_support_raft_taper")
 
         layout.separator()
         layout.operator("object.dice_gen_update", text="Regenerate Dice", icon='FILE_REFRESH')
@@ -3201,6 +4578,15 @@ class DiceGenPresets(bpy.types.PropertyGroup):
         default=20
     )
 
+    add_fin_supports: AddFinSupportsProperty
+    fin_support_contour_offset: FinSupportContourOffsetProperty
+    fin_support_connection_thickness: FinSupportConnectionThicknessProperty
+    fin_support_thickness: FinSupportThicknessProperty
+    fin_support_drop: FinSupportDropProperty
+    fin_support_raft_margin: FinSupportRaftMarginProperty
+    fin_support_raft_thickness: FinSupportRaftThicknessProperty
+    fin_support_raft_taper: FinSupportRaftTaperProperty
+
     add_numbers: AddNumbersProperty
     number_scale: NumberScaleProperty
     number_depth: NumberDepthProperty
@@ -3279,10 +4665,10 @@ class DiceGenPresets(bpy.types.PropertyGroup):
     height: FloatProperty(
         name='Dice Height',
         description='Height of the die (D10/D100)',
-        min=0.0,
-        soft_min=0.0,
-        max=100,
-        soft_max=100,
+        min=0.45,
+        soft_min=0.45,
+        max=2,
+        soft_max=2,
         default=2 / 3
     )
 
@@ -3372,6 +4758,14 @@ class DICE_OT_add_from_preset(bpy.types.Operator):
         soft_max=100,
         default=20
     )
+    add_fin_supports: AddFinSupportsProperty
+    fin_support_contour_offset: FinSupportContourOffsetProperty
+    fin_support_connection_thickness: FinSupportConnectionThicknessProperty
+    fin_support_thickness: FinSupportThicknessProperty
+    fin_support_drop: FinSupportDropProperty
+    fin_support_raft_margin: FinSupportRaftMarginProperty
+    fin_support_raft_thickness: FinSupportRaftThicknessProperty
+    fin_support_raft_taper: FinSupportRaftTaperProperty
     add_numbers: AddNumbersProperty
     number_scale: NumberScaleProperty
     number_depth: NumberDepthProperty
@@ -3452,10 +4846,10 @@ class DICE_OT_add_from_preset(bpy.types.Operator):
     height: FloatProperty(
         name='Dice Height',
         description='Height of the die (D10/D100)',
-        min=0.0,
-        soft_min=0.0,
-        max=100,
-        soft_max=100,
+        min=0.45,
+        soft_min=0.45,
+        max=2,
+        soft_max=2,
         default=2 / 3
     )
     number_v_offset: FloatProperty(
@@ -3548,25 +4942,30 @@ class DICE_OT_add_from_preset(bpy.types.Operator):
             if hasattr(self, prop_name):
                 # Special handling for number indicator properties
                 if prop_name == 'number_indicator_type':
-                    supports_indicators = self.dice_type in ['D6', 'D8', 'D10', 'D12', 'D20', 'D100'] or (
-                        self.dice_type == 'CUSTOM_TRAP' and self.num_faces >= 9) or (
-                        self.dice_type in ['CUSTOM_CRYSTAL', 'CUSTOM_SHARD', 'CUSTOM_BIPYRAMID'] and self.num_faces >= 6)
+                    supports_indicators = supports_number_indicators(self.dice_type, self.num_faces)
                     if self.add_numbers and supports_indicators:
                         layout.prop(self, prop_name)
                 elif prop_name in ['period_indicator_scale', 'period_indicator_space']:
-                    supports_indicators = self.dice_type in ['D6', 'D8', 'D10', 'D12', 'D20', 'D100'] or (
-                        self.dice_type == 'CUSTOM_TRAP' and self.num_faces >= 9) or (
-                        self.dice_type in ['CUSTOM_CRYSTAL', 'CUSTOM_SHARD', 'CUSTOM_BIPYRAMID'] and self.num_faces >= 6)
+                    supports_indicators = supports_number_indicators(self.dice_type, self.num_faces)
                     if self.add_numbers and supports_indicators and self.number_indicator_type == 'period':
                         layout.prop(self, prop_name)
                 elif prop_name in ['bar_indicator_height', 'bar_indicator_width', 'bar_indicator_space', 'center_bar']:
-                    supports_indicators = self.dice_type in ['D6', 'D8', 'D10', 'D12', 'D20', 'D100'] or (
-                        self.dice_type == 'CUSTOM_TRAP' and self.num_faces >= 9) or (
-                        self.dice_type in ['CUSTOM_CRYSTAL', 'CUSTOM_SHARD', 'CUSTOM_BIPYRAMID'] and self.num_faces >= 6)
+                    supports_indicators = supports_number_indicators(self.dice_type, self.num_faces)
                     if self.add_numbers and supports_indicators and self.number_indicator_type == 'bar':
                         layout.prop(self, prop_name)
                 else:
                     layout.prop(self, prop_name)
+
+        layout.separator()
+        layout.prop(self, "add_fin_supports")
+        if self.add_fin_supports:
+            layout.prop(self, "fin_support_contour_offset")
+            layout.prop(self, "fin_support_connection_thickness")
+            layout.prop(self, "fin_support_thickness")
+            layout.prop(self, "fin_support_drop")
+            layout.prop(self, "fin_support_raft_margin")
+            layout.prop(self, "fin_support_raft_thickness")
+            layout.prop(self, "fin_support_raft_taper")
 
     def invoke(self, context, event):
         """Initialize operator properties from presets when invoked"""
@@ -3576,6 +4975,14 @@ class DICE_OT_add_from_preset(bpy.types.Operator):
         self.dice_finish = presets.dice_finish
         self.bumper_scale = presets.bumper_scale
         self.size = presets.size
+        self.add_fin_supports = presets.add_fin_supports
+        self.fin_support_contour_offset = presets.fin_support_contour_offset
+        self.fin_support_connection_thickness = presets.fin_support_connection_thickness
+        self.fin_support_thickness = presets.fin_support_thickness
+        self.fin_support_drop = presets.fin_support_drop
+        self.fin_support_raft_margin = presets.fin_support_raft_margin
+        self.fin_support_raft_thickness = presets.fin_support_raft_thickness
+        self.fin_support_raft_taper = presets.fin_support_raft_taper
         self.add_numbers = presets.add_numbers
         self.number_scale = presets.number_scale
         self.number_depth = presets.number_depth
@@ -3684,70 +5091,86 @@ class DICE_OT_add_from_preset(bpy.types.Operator):
 
         # Create the mesh
         mesh = mesh_class("dice_body", self.size, **extra_params)
+        mesh.apply_print_layout(self.fin_support_drop if self.add_fin_supports else 0.0)
         dice_obj = mesh.create(context)
 
         # Apply dice finish
         configure_dice_finish_modifier(dice_obj, self.dice_finish, self.bumper_scale)
         body_material = ensure_material("Dice Body", (0.95, 0.95, 0.9, 1))
         assign_material(dice_obj, body_material)
+        clear_panel_artifacts(dice_obj)
+        clear_fin_support_artifacts(dice_obj)
+        remove_modifier_if_exists(dice_obj, 'boolean')
+        if "dice_numbers_name" in dice_obj:
+            del dice_obj["dice_numbers_name"]
+
+        font_path = validate_font_path(self.font_path) if self.font_path else ''
+        custom_image_path = validate_svg_path(self.custom_image_path) if self.custom_image_path else ''
+
+        indicator_type = NUMBER_IND_NONE
+        if supports_number_indicators(self.dice_type, self.num_faces):
+            indicator_type = self.number_indicator_type
 
         # Collect settings for saving
         settings_values = {}
         for attr in SETTINGS_ATTRS:
             if hasattr(self, attr):
                 settings_values[attr] = getattr(self, attr)
+        settings_values["font_path"] = font_path
+        settings_values["custom_image_path"] = custom_image_path
 
         numbers_object = None
-        # Add numbers if enabled
         if self.add_numbers:
-            number_indicator_type = NUMBER_IND_NONE
-            supports_indicators = (
-                self.dice_type in ['D6', 'D8', 'D10', 'D12', 'D20', 'D100']
-                or (self.dice_type == 'CUSTOM_TRAP' and self.num_faces >= 9)
-                or (self.dice_type in ['CUSTOM_CRYSTAL', 'CUSTOM_SHARD', 'CUSTOM_BIPYRAMID'] and self.num_faces >= 6)
+            numbers_object = create_numbers_object_for_mesh(
+                context,
+                mesh,
+                self.size,
+                self.number_scale,
+                self.number_depth,
+                font_path,
+                indicator_type,
+                self.period_indicator_scale,
+                self.period_indicator_space,
+                self.bar_indicator_height,
+                self.bar_indicator_width,
+                self.bar_indicator_space,
+                self.center_bar,
+                custom_image_face=self.custom_image_face,
+                custom_image_path=custom_image_path,
+                custom_image_scale=self.custom_image_scale,
             )
 
-            if supports_indicators:
-                number_indicator_type = self.number_indicator_type
+            if numbers_object is not None:
+                numbers_object.name = "dice_numbers"
+                apply_boolean_modifier(dice_obj, numbers_object)
 
-            if number_indicator_type == NUMBER_IND_NONE:
-                numbers_object = mesh.create_numbers(
-                    context,
-                    self.size,
-                    self.number_scale,
-                    self.number_depth,
-                    self.font_path if self.font_path else '',
-                    custom_image_face=self.custom_image_face,
-                    custom_image_path=self.custom_image_path if self.custom_image_path else '',
-                    custom_image_scale=self.custom_image_scale
-                )
-            else:
-                numbers_object = mesh.create_numbers(
-                    context,
-                    self.size,
-                    self.number_scale,
-                    self.number_depth,
-                    self.font_path if self.font_path else '',
-                    number_indicator_type,
-                    self.period_indicator_scale,
-                    self.period_indicator_space,
-                    self.bar_indicator_height,
-                    self.bar_indicator_width,
-                    self.bar_indicator_space,
-                    self.center_bar,
-                    custom_image_face=self.custom_image_face,
-                    custom_image_path=self.custom_image_path if self.custom_image_path else '',
-                    custom_image_scale=self.custom_image_scale
-                )
+        fin_support_object = generate_fin_supports(
+            context,
+            dice_obj,
+            mesh.get_output_vertices(),
+            mesh.faces,
+            settings_values,
+        )
+        if self.add_fin_supports and fin_support_object is None:
+            self.report({'WARNING'}, "Could not build fin supports for this die.")
 
         # Store metadata
         target_object = numbers_object or dice_obj
+        dice_obj["dice_gen_type"] = mesh_class.__name__
         target_object["dice_gen_type"] = mesh_class.__name__
         if numbers_object is not None:
             numbers_object["dice_body_name"] = dice_obj.name
 
         # Store settings on the object
+        apply_settings(dice_obj.dice_gen_settings, settings_values)
         apply_settings(target_object.dice_gen_settings, settings_values)
+
+        dice_collection = create_dice_collection(context, get_dice_type_label(self.dice_type))
+        organize_dice_objects_in_collection(
+            dice_obj,
+            dice_collection,
+            extra_objects=[numbers_object, fin_support_object],
+        )
 
         return {'FINISHED'}
 
@@ -3785,8 +5208,7 @@ class VIEW3D_PT_dice_gen_sidebar(bpy.types.Panel):
             box.prop(presets, "number_depth")
             box.prop(presets, "font_path")
 
-            # Number indicators (for D10/D100)
-            box.label(text="Number Indicators (D10/D100):")
+            box.label(text="Number Indicators:")
             box.prop(presets, "number_indicator_type")
             if presets.number_indicator_type == NUMBER_IND_PERIOD:
                 box.prop(presets, "period_indicator_scale")
@@ -3804,6 +5226,18 @@ class VIEW3D_PT_dice_gen_sidebar(bpy.types.Panel):
         if presets.custom_image_path:
             box.prop(presets, "custom_image_scale")
             box.label(text="(Image will appear on highest face)", icon='INFO')
+
+        box = layout.box()
+        box.label(text="Fin Supports", icon='MOD_SOLIDIFY')
+        box.prop(presets, "add_fin_supports")
+        if presets.add_fin_supports:
+            box.prop(presets, "fin_support_contour_offset")
+            box.prop(presets, "fin_support_connection_thickness")
+            box.prop(presets, "fin_support_thickness")
+            box.prop(presets, "fin_support_drop")
+            box.prop(presets, "fin_support_raft_margin")
+            box.prop(presets, "fin_support_raft_thickness")
+            box.prop(presets, "fin_support_raft_taper")
 
         # Dice Type Buttons
         layout.separator()
