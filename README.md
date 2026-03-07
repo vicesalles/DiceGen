@@ -1,6 +1,6 @@
 # Blender Dice Gen
 
-A Blender add-on that generates polyhedral dice, with built-in resin fin supports for resin printing.
+A Blender add-on that generates polyhedral dice
 
 ![](https://github.com/user-attachments/assets/52db5bd6-0d78-4d2a-b9cd-36b29cd95511)
 
