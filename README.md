@@ -37,7 +37,7 @@ The add-on will create a blank dice mesh and, if enabled, a separate numbers obj
 - Set dice type bumper (creates a "cage" around the dice corners, modifies dice mesh)
 - Added new Dice Gen section to Object properties to allow quick configuration changes of individual dice
 - Added new Dice Gen sidebar menu option to allow quickly creating multiple dice with the same configuration
-- Built-in resin fin supports for point-down printing
+- Built-in fin supports for resin printing
 - Automatic per-die collections to keep multi-die scenes organized
 
 ## Settings reference
