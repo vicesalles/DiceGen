@@ -4587,6 +4587,18 @@ def _compute_critical_value(numbers: List[str]) -> Optional[int]:
     return best
 
 
+def _project_onto_tangent_plane(vector: Vector, normal: Vector) -> Vector:
+    """Project *vector* onto the plane perpendicular to *normal*.
+    Returns a normalized tangent vector, or a fallback if the projection vanishes."""
+    tangent = vector - vector.dot(normal) * normal
+    if tangent.length < 1e-6:
+        # Pick an arbitrary axis not parallel to normal
+        fallback = Vector((1.0, 0.0, 0.0)) if abs(normal.x) < 0.9 else Vector((0.0, 1.0, 0.0))
+        tangent = fallback - fallback.dot(normal) * normal
+    tangent.normalize()
+    return tangent
+
+
 def _build_export_metadata(mesh_instance, body_obj: bpy.types.Object, die_type: str, asset_file: str = "") -> str:
     """
     Build a JSON metadata string describing the relationship between die
@@ -4610,6 +4622,10 @@ def _build_export_metadata(mesh_instance, body_obj: bpy.types.Object, die_type: 
         return ""
 
     critical_value = _compute_critical_value(numbers)
+
+    # Print-layout rotation applied during generation (identity if none).
+    # Must be applied to label up vectors so they match the rotated mesh.
+    print_rot = mesh_instance.print_rotation if hasattr(mesh_instance, 'print_rotation') else Matrix.Identity(3)
 
     # ------------------------------------------------------------------
     # D4 (Tetrahedron) — vertex-oriented labels, result = value at the
@@ -4651,8 +4667,12 @@ def _build_export_metadata(mesh_instance, body_obj: bpy.types.Object, die_type: 
                 if num_idx < len(rotations):
                     rot = Euler(rotations[num_idx])
                     up_vec.rotate(rot)
+                    up_vec = print_rot @ up_vec
                     up_vec.normalize()
                 face_idx = face_indices[num_idx] - 1 if face_indices and num_idx < len(face_indices) and face_indices[num_idx] > 0 else -1
+                # Ensure tangent to face
+                if face_idx >= 0 and face_idx < len(face_normals):
+                    up_vec = _project_onto_tangent_plane(up_vec, face_normals[face_idx])
                 value_labels[value].append({
                     "face_index": face_idx,
                     "up": [round(up_vec.x, 6), round(up_vec.y, 6), round(up_vec.z, 6)]
@@ -4738,7 +4758,12 @@ def _build_export_metadata(mesh_instance, body_obj: bpy.types.Object, die_type: 
             if num_idx < len(rotations):
                 rot = Euler(rotations[num_idx])
                 up_vec.rotate(rot)
+                up_vec = print_rot @ up_vec
                 up_vec.normalize()
+
+            # Project onto face tangent plane to guarantee perpendicularity
+            face_normal = Vector(faces_meta[face_data_idx]["normal"])
+            up_vec = _project_onto_tangent_plane(up_vec, face_normal)
 
             value_int = int(value) if value.isdigit() else None
             value_entry: Dict[str, Any] = {
