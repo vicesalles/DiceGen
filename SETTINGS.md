@@ -27,14 +27,24 @@ These appear only on supported dice and only when numbers are enabled.
 
 - `Orientation Indicator`: marker used to distinguish `6` and `9`.
   `None`: no marker.
-  `Period`: adds a dot.
+  `Period`: adds a period after the number (e.g., `6.`).
   `Bar`: adds a short underline bar.
+  `Dot`: adds a small dot below the number.
 - `Period Scale`: scales the period marker.
 - `Period Space`: distance between the number and period.
 - `Bar Height`: height scale for the underline bar.
 - `Bar Width`: width scale for the underline bar.
 - `Bar Space`: distance between the number and the bar.
 - `Center Align Bar`: includes the bar in the vertical alignment of the number layout.
+- `Dot Scale`: scales the dot marker below `6` and `9`.
+- `Dot Space`: distance between the number and the dot.
+
+## Critical face material settings
+
+- `Use Critical Face Material`: when enabled, the highest-value face label gets its own material instead of sharing the default number material.
+- `Critical Face Material`: the color used for the highest-value face label. This is independent from the die body material and the regular number material.
+
+This works together with custom SVG images: if the highest face is replaced by a custom image, that image still receives the critical face material.
 
 ## Custom image settings
 

@@ -8,13 +8,13 @@ from typing import List, Tuple, Optional, Dict, Any
 from math import sqrt, acos, pow
 from mathutils import Vector, Matrix, Euler
 from bpy.types import Menu
-from bpy.props import FloatProperty, BoolProperty, StringProperty, EnumProperty, PointerProperty, IntProperty
+from bpy.props import FloatProperty, BoolProperty, StringProperty, EnumProperty, PointerProperty, IntProperty, FloatVectorProperty
 from bpy_extras.object_utils import object_data_add
 
 bl_info = {
-    'name': 'DiceGen 5.x',
-    'author': 'Long Tran, shawn-makes-stuff',
-    'version': (1, 2, 0),
+    'name': 'DiceGen 5.x GG edition',
+    'author': 'Long Tran, shawn-makes-stuff, vicesalles',
+    'version': (1, 3, 0),
     'blender': (5, 0, 0),
     'location': 'View3D > Add > Mesh',
     'description': 'Generate polyhedral dice models.',
@@ -26,6 +26,7 @@ bl_info = {
 NUMBER_IND_NONE = 'none'
 NUMBER_IND_BAR = 'bar'
 NUMBER_IND_PERIOD = 'period'
+NUMBER_IND_DOT = 'dot'
 PANEL_POCKET_BOOLEAN_NAME = "panel_pocket_boolean"
 PANEL_NUMBER_BOOLEAN_NAME = "panel_number_boolean"
 PANEL_TOP_FACE_BOOLEAN_NAME = "panel_top_face_boolean"
@@ -249,25 +250,23 @@ class Mesh:
     def create_numbers(self, context, size, number_scale, number_depth, font_path,
                        number_indicator_type=NUMBER_IND_NONE, period_indicator_scale=1, period_indicator_space=1,
                        bar_indicator_height=1, bar_indicator_width=1, bar_indicator_space=1,
-                       center_bar=True, custom_image_face=0, custom_image_path='', custom_image_scale=1):
-        numbers = self.get_numbers()
-        locations = self.transform_number_locations(self.get_number_locations())
-        rotations = self.transform_number_rotations(self.get_number_rotations())
-
-        font_size = self.base_font_scale * size * number_scale
-
-        numbers_object = create_numbers(context, numbers, locations, rotations, font_path, font_size, number_depth,
-                                        number_indicator_type, period_indicator_scale, period_indicator_space,
-                                        bar_indicator_height, bar_indicator_width, bar_indicator_space,
-                                        center_bar, custom_image_face=custom_image_face,
-                                        custom_image_path=custom_image_path, custom_image_scale=custom_image_scale)
-
-        if numbers_object is not None:
-            numbers_object.name = "dice_numbers"
-            apply_boolean_modifier(self.dice_mesh, numbers_object)
-            return numbers_object
-
-        return None
+                       center_bar=True, custom_image_face=0, custom_image_path='', custom_image_scale=1,
+                       use_critical_face_material=False, critical_face_material=(1.0, 0.0, 0.0, 1.0),
+                       dot_indicator_scale=1, dot_indicator_space=1):
+        numbers_objects = create_numbers_object_for_mesh(
+            context, self, size, number_scale, number_depth, font_path,
+            number_indicator_type, period_indicator_scale, period_indicator_space,
+            bar_indicator_height, bar_indicator_width, bar_indicator_space, center_bar,
+            custom_image_face, custom_image_path, custom_image_scale,
+            use_critical_face_material=use_critical_face_material,
+            critical_face_material=critical_face_material,
+            dot_indicator_scale=dot_indicator_scale,
+            dot_indicator_space=dot_indicator_space,
+        )
+        for idx, num_obj in enumerate(numbers_objects):
+            mod_name = 'boolean' if idx == 0 else 'boolean_critical'
+            apply_boolean_modifier(self.dice_mesh, num_obj, modifier_name=mod_name)
+        return numbers_objects[0] if numbers_objects else None
 
 
 class Tetrahedron(Mesh):
@@ -1958,6 +1957,10 @@ def organize_dice_objects_in_collection(body_object: bpy.types.Object,
     if numbers_name:
         objects_to_move.append(bpy.data.objects.get(numbers_name))
 
+    critical_name = body_object.get("dice_critical_numbers_name")
+    if critical_name:
+        objects_to_move.append(bpy.data.objects.get(critical_name))
+
     fin_support_name = body_object.get(FIN_SUPPORT_OBJECT_KEY)
     if fin_support_name:
         objects_to_move.append(bpy.data.objects.get(fin_support_name))
@@ -2186,6 +2189,10 @@ SETTINGS_ATTRS = [
     "custom_image_path",
     "custom_image_face",
     "custom_image_scale",
+    "use_critical_face_material",
+    "critical_face_material",
+    "dot_indicator_scale",
+    "dot_indicator_space",
 ]
 
 
@@ -3031,10 +3038,70 @@ def add_bar_indicator(context, mesh_object: bpy.types.Object, font_size: float,
     return mesh_object
 
 
+def add_dot_indicator(context, mesh_object: bpy.types.Object, font_size: float,
+                      number_depth: float, dot_indicator_scale: float,
+                      dot_indicator_space: float) -> bpy.types.Object:
+    """
+    Add a small dot indicator below numbers 6 and 9 for orientation.
+
+    Args:
+        context: Blender context
+        mesh_object: The number mesh to add indicator to
+        font_size: Base font size
+        number_depth: Depth of the number extrusion
+        dot_indicator_scale: Scale factor for the dot
+        dot_indicator_space: Spacing between number and dot
+
+    Returns:
+        The combined mesh object with dot indicator
+    """
+    dot_diameter = (1 / 12) * font_size * dot_indicator_scale
+    dot_space = (1 / 20) * font_size * dot_indicator_space
+
+    # Create a small cylinder (octagon prism) as mesh for boolean cutting
+    radius = dot_diameter / 2
+    segments = 8
+    verts = []
+    faces = []
+
+    # Top circle at +number_depth
+    for i in range(segments):
+        angle = 2 * math.pi * i / segments
+        verts.append((radius * math.cos(angle), radius * math.sin(angle), number_depth))
+
+    # Bottom circle at -number_depth
+    for i in range(segments):
+        angle = 2 * math.pi * i / segments
+        verts.append((radius * math.cos(angle), radius * math.sin(angle), -number_depth))
+
+    # Top face
+    faces.append(list(range(segments)))
+    # Bottom face (reversed winding)
+    faces.append(list(range(2 * segments - 1, segments - 1, -1)))
+    # Side faces
+    for i in range(segments):
+        next_i = (i + 1) % segments
+        faces.append([i, next_i, next_i + segments, i + segments])
+
+    dot_obj = create_mesh(context, verts, faces, 'dot_indicator')
+
+    # Position dot centered below the number
+    dot_obj.location = Vector((
+        mesh_object.location.x,
+        mesh_object.location.y - (mesh_object.dimensions.y / 2) - dot_space - radius,
+        0
+    ))
+
+    # Join dot to number
+    return join([mesh_object, dot_obj])
+
+
 def create_numbers(context, numbers, locations, rotations, font_path, font_size, number_depth, number_indicator_type,
                    period_indicator_scale, period_indicator_space, bar_indicator_height, bar_indicator_width,
                    bar_indicator_space, center_bar, custom_image_face=0, custom_image_path='',
-                   custom_image_scale=1, original_indices=None):
+                   custom_image_scale=1, original_indices=None,
+                   material_name="Dice Numbers", material_color=(0, 0, 0, 1),
+                   dot_indicator_scale=1, dot_indicator_space=1):
     number_objs = []
     # create the number meshes
     for i in range(len(locations)):
@@ -3044,14 +3111,16 @@ def create_numbers(context, numbers, locations, rotations, font_path, font_size,
                                       period_indicator_space, bar_indicator_height, bar_indicator_width,
                                       bar_indicator_space, center_bar,
                                       custom_image_face=custom_image_face, custom_image_path=custom_image_path,
-                                      custom_image_scale=custom_image_scale, index=index_value)
+                                      custom_image_scale=custom_image_scale, index=index_value,
+                                      dot_indicator_scale=dot_indicator_scale,
+                                      dot_indicator_space=dot_indicator_space)
         number_objs.append(number_object)
 
     # join the numbers into a single object
     if len(number_objs):
         numbers = join(number_objs)
         apply_transform(numbers, use_rotation=True, use_location=True)
-        numbers_material = ensure_material("Dice Numbers", (0, 0, 0, 1))
+        numbers_material = ensure_material(material_name, material_color)
         assign_material(numbers, numbers_material)
         return numbers
 
@@ -3061,7 +3130,8 @@ def create_numbers(context, numbers, locations, rotations, font_path, font_size,
 def create_number(context, number, font_path, font_size, number_depth, location, rotation, number_indicator_type,
                   period_indicator_scale, period_indicator_space, bar_indicator_height, bar_indicator_width,
                   bar_indicator_space, center_bar, custom_image_face=0, custom_image_path='',
-                  custom_image_scale=1, index=0):
+                  custom_image_scale=1, index=0,
+                  dot_indicator_scale=1, dot_indicator_space=1):
     """
     Create a number mesh that will be used in a boolean modifier
     """
@@ -3090,6 +3160,9 @@ def create_number(context, number, font_path, font_size, number_depth, location,
                 mesh_object = add_bar_indicator(context, mesh_object, font_size, number_depth,
                                                 bar_indicator_height, bar_indicator_width,
                                                 bar_indicator_space, center_bar)
+            elif number_indicator_type == NUMBER_IND_DOT:
+                mesh_object = add_dot_indicator(context, mesh_object, font_size, number_depth,
+                                                dot_indicator_scale, dot_indicator_space)
 
     mesh_object.location.x = location[0]
     mesh_object.location.y = location[1]
@@ -3506,7 +3579,11 @@ def create_numbers_object_for_mesh(context,
                                    custom_image_path: str = '',
                                    custom_image_scale: float = 1,
                                    location_override: Optional[List[Tuple[float, float, float]]] = None,
-                                   include_indices: Optional[List[int]] = None) -> Optional[bpy.types.Object]:
+                                    include_indices: Optional[List[int]] = None,
+                                    use_critical_face_material: bool = False,
+                                    critical_face_material: Tuple[float, float, float, float] = (1.0, 0.0, 0.0, 1.0),
+                                    dot_indicator_scale: float = 1,
+                                    dot_indicator_space: float = 1) -> List[bpy.types.Object]:
     all_numbers = mesh.get_numbers()
     if location_override is not None:
         all_locations = location_override
@@ -3515,7 +3592,14 @@ def create_numbers_object_for_mesh(context,
     all_rotations = mesh.transform_number_rotations(mesh.get_number_rotations())
 
     if len(all_numbers) != len(all_locations) or len(all_numbers) != len(all_rotations):
-        return None
+        return []
+
+    # Determine critical face indices from the full mesh before filtering
+    critical_indices_set = set()
+    if use_critical_face_material and mesh.faces:
+        highest_face = get_highest_value_face_index(mesh)
+        if highest_face > 0:
+            critical_indices_set = set(get_number_indices_for_face(mesh, highest_face))
 
     if include_indices is None:
         indices = list(range(len(all_numbers)))
@@ -3526,33 +3610,77 @@ def create_numbers_object_for_mesh(context,
         ]
 
     if not indices:
-        return None
+        return []
 
-    numbers = [all_numbers[idx] for idx in indices]
-    locations = [all_locations[idx] for idx in indices]
-    rotations = [all_rotations[idx] for idx in indices]
+    regular_indices = [idx for idx in indices if idx not in critical_indices_set]
+    critical_indices = [idx for idx in indices if idx in critical_indices_set]
 
     font_size = mesh.base_font_scale * size * number_scale
-    return create_numbers(
-        context,
-        numbers,
-        locations,
-        rotations,
-        font_path,
-        font_size,
-        number_depth,
-        number_indicator_type,
-        period_indicator_scale,
-        period_indicator_space,
-        bar_indicator_height,
-        bar_indicator_width,
-        bar_indicator_space,
-        center_bar,
-        custom_image_face=custom_image_face,
-        custom_image_path=custom_image_path,
-        custom_image_scale=custom_image_scale,
-        original_indices=indices,
-    )
+    result = []
+
+    if regular_indices:
+        numbers = [all_numbers[idx] for idx in regular_indices]
+        locations = [all_locations[idx] for idx in regular_indices]
+        rotations = [all_rotations[idx] for idx in regular_indices]
+        regular_obj = create_numbers(
+            context,
+            numbers,
+            locations,
+            rotations,
+            font_path,
+            font_size,
+            number_depth,
+            number_indicator_type,
+            period_indicator_scale,
+            period_indicator_space,
+            bar_indicator_height,
+            bar_indicator_width,
+            bar_indicator_space,
+            center_bar,
+            custom_image_face=custom_image_face,
+            custom_image_path=custom_image_path,
+            custom_image_scale=custom_image_scale,
+            original_indices=regular_indices,
+            material_name="Dice Numbers",
+            material_color=(0, 0, 0, 1),
+            dot_indicator_scale=dot_indicator_scale,
+            dot_indicator_space=dot_indicator_space,
+        )
+        if regular_obj is not None:
+            result.append(regular_obj)
+
+    if critical_indices:
+        numbers = [all_numbers[idx] for idx in critical_indices]
+        locations = [all_locations[idx] for idx in critical_indices]
+        rotations = [all_rotations[idx] for idx in critical_indices]
+        critical_obj = create_numbers(
+            context,
+            numbers,
+            locations,
+            rotations,
+            font_path,
+            font_size,
+            number_depth,
+            number_indicator_type,
+            period_indicator_scale,
+            period_indicator_space,
+            bar_indicator_height,
+            bar_indicator_width,
+            bar_indicator_space,
+            center_bar,
+            custom_image_face=custom_image_face,
+            custom_image_path=custom_image_path,
+            custom_image_scale=custom_image_scale,
+            original_indices=critical_indices,
+            material_name="Dice Critical Face",
+            material_color=critical_face_material,
+            dot_indicator_scale=dot_indicator_scale,
+            dot_indicator_space=dot_indicator_space,
+        )
+        if critical_obj is not None:
+            result.append(critical_obj)
+
+    return result
 
 
 def create_panel_number_cutters(context,
@@ -3588,7 +3716,7 @@ def create_panel_number_cutters(context,
         if idx not in exclude_indices
     ]
 
-    return create_numbers_object_for_mesh(
+    result = create_numbers_object_for_mesh(
         context,
         mesh,
         size,
@@ -3608,6 +3736,7 @@ def create_panel_number_cutters(context,
         location_override=shifted_locations,
         include_indices=include_indices,
     )
+    return result[0] if result else None
 
 
 def create_top_face_direct_cutter(context,
@@ -3638,7 +3767,7 @@ def create_top_face_direct_cutter(context,
     scaled_number_scale = max(number_scale * scale_multiplier, 0.05)
     forced_custom_face = (top_face_number_indices[0] + 1) if custom_image_path else 0
 
-    return create_numbers_object_for_mesh(
+    result = create_numbers_object_for_mesh(
         context,
         mesh,
         size,
@@ -3657,6 +3786,7 @@ def create_top_face_direct_cutter(context,
         custom_image_scale=custom_image_scale,
         include_indices=top_face_number_indices,
     )
+    return result[0] if result else None
 
 
 def execute_generator(op, context, mesh_cls, name: str, **kwargs) -> Dict[str, str]:
@@ -3695,28 +3825,25 @@ def execute_generator(op, context, mesh_cls, name: str, **kwargs) -> Dict[str, s
     settings_template = die_obj.dice_gen_settings
     settings_values = collect_settings_from_op(op, settings_template)
 
-    numbers_object = None
+    numbers_objects = []
     # create number curves
     if op.add_numbers:
-        if op.number_indicator_type == NUMBER_IND_NONE:
-            numbers_object = die.create_numbers(
-                context, op.size, op.number_scale, op.number_depth, op.font_path,
-                custom_image_face=op.custom_image_face, custom_image_path=op.custom_image_path,
-                custom_image_scale=op.custom_image_scale
-            )
-        else:
-            numbers_object = die.create_numbers(
-                context, op.size, op.number_scale, op.number_depth, op.font_path,
-                op.number_indicator_type, op.period_indicator_scale, op.period_indicator_space,
-                op.bar_indicator_height, op.bar_indicator_width, op.bar_indicator_space, op.center_bar,
-                custom_image_face=op.custom_image_face, custom_image_path=op.custom_image_path,
-                custom_image_scale=op.custom_image_scale
-            )
+        numbers_objects = die.create_numbers(
+            context, op.size, op.number_scale, op.number_depth, op.font_path,
+            op.number_indicator_type, op.period_indicator_scale, op.period_indicator_space,
+            op.bar_indicator_height, op.bar_indicator_width, op.bar_indicator_space, op.center_bar,
+            custom_image_face=op.custom_image_face, custom_image_path=op.custom_image_path,
+            custom_image_scale=op.custom_image_scale,
+            use_critical_face_material=getattr(op, "use_critical_face_material", False),
+            critical_face_material=getattr(op, "critical_face_material", (1.0, 0.0, 0.0, 1.0)),
+            dot_indicator_scale=getattr(op, "dot_indicator_scale", 1),
+            dot_indicator_space=getattr(op, "dot_indicator_space", 1),
+        )
 
-    target_object = numbers_object or die_obj
+    target_object = numbers_objects[0] if numbers_objects else die_obj
     target_object["dice_gen_type"] = mesh_cls.__name__
-    if numbers_object is not None:
-        numbers_object["dice_body_name"] = die_obj.name
+    for num_obj in numbers_objects:
+        num_obj["dice_body_name"] = die_obj.name
 
     apply_settings(target_object.dice_gen_settings, settings_values)
 
@@ -3923,9 +4050,10 @@ CustomImageScaleProperty = FloatProperty(
 def NumberIndicatorTypeProperty(default: str = NUMBER_IND_PERIOD):
     return EnumProperty(
         name='Orientation Indicator',
-        items=((NUMBER_IND_NONE, 'None', ','),
-               (NUMBER_IND_BAR, 'Bar', ''),
-               (NUMBER_IND_PERIOD, 'Period', '')),
+        items=((NUMBER_IND_NONE, 'None', 'No indicator'),
+               (NUMBER_IND_BAR, 'Bar', 'Horizontal bar'),
+               (NUMBER_IND_PERIOD, 'Period', 'Period after number'),
+               (NUMBER_IND_DOT, 'Dot', 'Small dot below number')),
         default=default,
         description='Orientation indicator for numbers 6 and 9'
     )
@@ -3985,6 +4113,42 @@ CenterBarProperty = BoolProperty(
     name='Center Align Bar',
     description='If true, the bar indicator is included in the vertical alignment of the number',
     default=True
+)
+
+DotIndicatorScaleProperty = FloatProperty(
+    name='Dot Scale',
+    description='Scale of the dot orientation indicator relative to the number',
+    min=0.1,
+    soft_min=0.1,
+    max=3,
+    soft_max=3,
+    default=1
+)
+
+DotIndicatorSpaceProperty = FloatProperty(
+    name='Dot Space',
+    description='Space between the dot orientation indicator and the number',
+    min=0,
+    soft_min=0,
+    max=3,
+    soft_max=3,
+    default=1
+)
+
+UseCriticalFaceMaterialProperty = BoolProperty(
+    name='Use Critical Face Material',
+    description='Assign a distinct material to the highest-value face label',
+    default=False
+)
+
+CriticalFaceMaterialProperty = FloatVectorProperty(
+    name='Critical Face Material',
+    description='Material color for the highest-value face label',
+    subtype='COLOR',
+    size=4,
+    min=0.0,
+    max=1.0,
+    default=(1.0, 0.0, 0.0, 1.0)
 )
 
 
@@ -4096,6 +4260,10 @@ class DiceGenSettings(bpy.types.PropertyGroup):
 
     custom_image_scale: CustomImageScaleProperty
 
+    use_critical_face_material: UseCriticalFaceMaterialProperty
+
+    critical_face_material: CriticalFaceMaterialProperty
+
     number_scale: NumberScaleProperty
 
     number_depth: NumberDepthProperty
@@ -4132,6 +4300,10 @@ class DiceGenSettings(bpy.types.PropertyGroup):
     bar_indicator_space: BarIndicatorSpaceProperty
 
     center_bar: CenterBarProperty
+
+    dot_indicator_scale: DotIndicatorScaleProperty
+
+    dot_indicator_space: DotIndicatorSpaceProperty
 
     number_v_offset: NumberVOffsetProperty(0.0)
 
@@ -4367,14 +4539,24 @@ class OBJECT_OT_dice_gen_update(bpy.types.Operator):
         settings_values["custom_image_path"] = custom_image_path
 
         old_numbers_name = body_obj.get("dice_numbers_name")
+        old_critical_name = body_obj.get("dice_critical_numbers_name")
         if settings_owner.get("dice_body_name"):
-            old_numbers_name = settings_owner.name
+            owner_name = settings_owner.name
+            if owner_name == old_critical_name:
+                pass  # already tracked
+            else:
+                old_numbers_name = owner_name
 
-        remove_modifier_if_exists(body_obj, 'boolean')
-        if "dice_numbers_name" in body_obj:
-            del body_obj["dice_numbers_name"]
-        if old_numbers_name and old_numbers_name != body_obj.name:
-            remove_object_if_exists(old_numbers_name)
+        for mod_name in ('boolean', 'boolean_critical'):
+            remove_modifier_if_exists(body_obj, mod_name)
+
+        for key in ("dice_numbers_name", "dice_critical_numbers_name"):
+            if key in body_obj:
+                del body_obj[key]
+
+        for name in (old_numbers_name, old_critical_name):
+            if name and name != body_obj.name:
+                remove_object_if_exists(name)
 
         clear_panel_artifacts(body_obj)
         clear_fin_support_artifacts(body_obj)
@@ -4390,9 +4572,9 @@ class OBJECT_OT_dice_gen_update(bpy.types.Operator):
         if supports_number_indicators(die_type, settings_values["num_faces"]):
             indicator_type = settings_values["number_indicator_type"]
 
-        new_numbers_obj = None
+        new_numbers_objects = []
         if settings_values["add_numbers"]:
-            new_numbers_obj = create_numbers_object_for_mesh(
+            new_numbers_objects = create_numbers_object_for_mesh(
                 context,
                 die,
                 size,
@@ -4409,14 +4591,20 @@ class OBJECT_OT_dice_gen_update(bpy.types.Operator):
                 settings_values["custom_image_face"],
                 custom_image_path,
                 settings_values["custom_image_scale"],
+                use_critical_face_material=settings_values.get("use_critical_face_material", False),
+                critical_face_material=settings_values.get("critical_face_material", (1.0, 0.0, 0.0, 1.0)),
+                dot_indicator_scale=settings_values.get("dot_indicator_scale", 1),
+                dot_indicator_space=settings_values.get("dot_indicator_space", 1),
             )
 
-            if new_numbers_obj is not None:
-                new_numbers_obj.name = "dice_numbers"
-                apply_boolean_modifier(body_obj, new_numbers_obj)
-                new_numbers_obj["dice_body_name"] = body_obj.name
-                new_numbers_obj["dice_gen_type"] = die_type
-                apply_settings(new_numbers_obj.dice_gen_settings, settings_values)
+            for idx, num_obj in enumerate(new_numbers_objects):
+                num_obj.name = "dice_numbers" if idx == 0 else "dice_numbers_critical"
+                mod_name = 'boolean' if idx == 0 else 'boolean_critical'
+                remember = 'dice_numbers_name' if idx == 0 else 'dice_critical_numbers_name'
+                apply_boolean_modifier(body_obj, num_obj, modifier_name=mod_name, remember_key=remember)
+                num_obj["dice_body_name"] = body_obj.name
+                num_obj["dice_gen_type"] = die_type
+                apply_settings(num_obj.dice_gen_settings, settings_values)
 
         fin_support_object = generate_fin_supports(
             context,
@@ -4432,10 +4620,13 @@ class OBJECT_OT_dice_gen_update(bpy.types.Operator):
         apply_settings(body_obj.dice_gen_settings, settings_values)
 
         target_collection = body_obj.users_collection[0] if body_obj.users_collection else context.scene.collection
+        extra_objs = list(new_numbers_objects)
+        if fin_support_object is not None:
+            extra_objs.append(fin_support_object)
         organize_dice_objects_in_collection(
             body_obj,
             target_collection,
-            extra_objects=[new_numbers_obj, fin_support_object],
+            extra_objects=extra_objs,
         )
 
         return {'FINISHED'}
@@ -4472,6 +4663,13 @@ class OBJECT_PT_dice_gen(bpy.types.Panel):
         box.label(text="Numbers", icon='OUTLINER_OB_FONT')
         box.prop(settings, "number_scale")
         box.prop(settings, "number_depth")
+        box.prop(settings, "use_critical_face_material")
+        if settings.use_critical_face_material:
+            box.prop(settings, "critical_face_material")
+        box.prop(settings, "number_indicator_type")
+        if settings.number_indicator_type == NUMBER_IND_DOT:
+            box.prop(settings, "dot_indicator_scale")
+            box.prop(settings, "dot_indicator_space")
 
         # Custom Image Settings
         box = layout.box()
@@ -4600,9 +4798,17 @@ class DiceGenPresets(bpy.types.PropertyGroup):
     bar_indicator_space: BarIndicatorSpaceProperty
     center_bar: CenterBarProperty
 
+    dot_indicator_scale: DotIndicatorScaleProperty
+
+    dot_indicator_space: DotIndicatorSpaceProperty
+
     custom_image_path: CustomImagePathProperty
     custom_image_face: CustomImageFaceProperty(20)
     custom_image_scale: CustomImageScaleProperty
+
+    use_critical_face_material: UseCriticalFaceMaterialProperty
+
+    critical_face_material: CriticalFaceMaterialProperty
 
     number_center_offset: FloatProperty(
         name='Number Center Offset',
@@ -4777,6 +4983,8 @@ class DICE_OT_add_from_preset(bpy.types.Operator):
     bar_indicator_width: BarIndicatorWidthProperty
     bar_indicator_space: BarIndicatorSpaceProperty
     center_bar: CenterBarProperty
+    dot_indicator_scale: DotIndicatorScaleProperty
+    dot_indicator_space: DotIndicatorSpaceProperty
     custom_image_path: CustomImagePathProperty
     custom_image_face: IntProperty(
         name='Custom Image Face',
@@ -4786,6 +4994,8 @@ class DICE_OT_add_from_preset(bpy.types.Operator):
         default=0
     )
     custom_image_scale: CustomImageScaleProperty
+    use_critical_face_material: UseCriticalFaceMaterialProperty
+    critical_face_material: CriticalFaceMaterialProperty
 
     # Geometry-specific properties
     number_center_offset: FloatProperty(
@@ -4879,47 +5089,53 @@ class DICE_OT_add_from_preset(bpy.types.Operator):
         # Define which properties are relevant for each dice type
         property_relevance = {
             'D4': ['size', 'number_center_offset', 'add_numbers', 'number_scale', 'number_depth',
-                   'number_h_offset', 'number_v_offset', 'font_path', 'custom_image_path', 'custom_image_face', 'custom_image_scale'],
+                   'number_h_offset', 'number_v_offset', 'font_path', 'custom_image_path', 'custom_image_face', 'custom_image_scale', 'use_critical_face_material', 'critical_face_material'],
             'D4_CRYSTAL': ['size', 'base_height', 'top_point_height', 'bottom_point_height', 'add_numbers', 'number_scale',
-                          'number_depth', 'number_h_offset', 'number_v_offset', 'font_path', 'custom_image_path', 'custom_image_face', 'custom_image_scale'],
+                          'number_depth', 'number_h_offset', 'number_v_offset', 'font_path', 'custom_image_path', 'custom_image_face', 'custom_image_scale', 'use_critical_face_material', 'critical_face_material'],
             'D4_SHARD': ['size', 'top_point_height', 'bottom_point_height',
                         'add_numbers', 'number_scale', 'number_depth', 'number_h_offset', 'number_v_offset', 'font_path',
-                        'custom_image_path', 'custom_image_face', 'custom_image_scale'],
+                        'custom_image_path', 'custom_image_face', 'custom_image_scale', 'use_critical_face_material', 'critical_face_material'],
             'D6': ['size', 'add_numbers', 'number_scale', 'number_depth', 'number_h_offset', 'number_v_offset', 'font_path',
                    'number_indicator_type', 'period_indicator_scale', 'period_indicator_space',
                    'bar_indicator_height', 'bar_indicator_width', 'bar_indicator_space', 'center_bar',
-                   'custom_image_path', 'custom_image_face', 'custom_image_scale'],
+                   'dot_indicator_scale', 'dot_indicator_space',
+                   'custom_image_path', 'custom_image_face', 'custom_image_scale', 'use_critical_face_material', 'critical_face_material'],
             'D8': ['size', 'add_numbers', 'number_scale', 'number_depth', 'number_h_offset', 'number_v_offset', 'font_path',
-                   'custom_image_path', 'custom_image_face', 'custom_image_scale'],
+                   'custom_image_path', 'custom_image_face', 'custom_image_scale', 'use_critical_face_material', 'critical_face_material'],
             'D10': ['size', 'height', 'add_numbers', 'number_scale', 'number_depth', 'number_h_offset', 'number_v_offset',
-                   'font_path', 'custom_image_path', 'custom_image_face', 'custom_image_scale'],
+                   'font_path', 'custom_image_path', 'custom_image_face', 'custom_image_scale', 'use_critical_face_material', 'critical_face_material'],
             'D100': ['size', 'height', 'add_numbers', 'number_scale', 'number_depth', 'number_h_offset', 'number_v_offset',
-                    'font_path', 'custom_image_path', 'custom_image_face', 'custom_image_scale'],
+                    'font_path', 'custom_image_path', 'custom_image_face', 'custom_image_scale', 'use_critical_face_material', 'critical_face_material'],
             'CUSTOM_TRAP': ['size', 'num_faces', 'height', 'add_numbers', 'number_scale',
                             'number_depth', 'number_h_offset', 'number_v_offset', 'font_path',
                             'number_indicator_type', 'period_indicator_scale', 'period_indicator_space',
                             'bar_indicator_height', 'bar_indicator_width', 'bar_indicator_space', 'center_bar',
-                            'custom_image_path', 'custom_image_face', 'custom_image_scale'],
+                            'dot_indicator_scale', 'dot_indicator_space',
+                            'custom_image_path', 'custom_image_face', 'custom_image_scale', 'use_critical_face_material', 'critical_face_material'],
             'D12': ['size', 'add_numbers', 'number_scale', 'number_depth', 'number_h_offset', 'number_v_offset', 'font_path',
-                    'custom_image_path', 'custom_image_face', 'custom_image_scale'],
+                    'custom_image_path', 'custom_image_face', 'custom_image_scale', 'use_critical_face_material', 'critical_face_material'],
             'D20': ['size', 'add_numbers', 'number_scale', 'number_depth', 'number_h_offset', 'number_v_offset', 'font_path',
                     'number_indicator_type', 'period_indicator_scale', 'period_indicator_space',
-                    'custom_image_path', 'custom_image_face', 'custom_image_scale'],
+                    'dot_indicator_scale', 'dot_indicator_space',
+                    'custom_image_path', 'custom_image_face', 'custom_image_scale', 'use_critical_face_material', 'critical_face_material'],
             'CUSTOM_CRYSTAL': ['size', 'num_faces', 'base_height', 'top_point_height', 'bottom_point_height', 'add_numbers',
                               'number_scale', 'number_depth', 'number_h_offset', 'number_v_offset', 'font_path',
                               'number_indicator_type', 'period_indicator_scale', 'period_indicator_space',
                               'bar_indicator_height', 'bar_indicator_width', 'bar_indicator_space', 'center_bar',
-                              'custom_image_path', 'custom_image_face', 'custom_image_scale'],
+                              'dot_indicator_scale', 'dot_indicator_space',
+                              'custom_image_path', 'custom_image_face', 'custom_image_scale', 'use_critical_face_material', 'critical_face_material'],
             'CUSTOM_SHARD': ['size', 'num_faces', 'top_point_height', 'bottom_point_height',
                             'add_numbers', 'number_scale', 'number_depth', 'number_h_offset', 'number_v_offset', 'font_path',
                             'number_indicator_type', 'period_indicator_scale', 'period_indicator_space',
                             'bar_indicator_height', 'bar_indicator_width', 'bar_indicator_space', 'center_bar',
-                            'custom_image_path', 'custom_image_face', 'custom_image_scale'],
+                            'dot_indicator_scale', 'dot_indicator_space',
+                            'custom_image_path', 'custom_image_face', 'custom_image_scale', 'use_critical_face_material', 'critical_face_material'],
             'CUSTOM_BIPYRAMID': ['size', 'num_faces', 'top_point_height', 'bottom_point_height',
                                 'add_numbers', 'number_scale', 'number_depth', 'number_h_offset', 'number_v_offset', 'font_path',
                                 'number_indicator_type', 'period_indicator_scale', 'period_indicator_space',
                                 'bar_indicator_height', 'bar_indicator_width', 'bar_indicator_space', 'center_bar',
-                                'custom_image_path', 'custom_image_face', 'custom_image_scale'],
+                                'dot_indicator_scale', 'dot_indicator_space',
+                                'custom_image_path', 'custom_image_face', 'custom_image_scale', 'use_critical_face_material', 'critical_face_material'],
         }
 
         # Always show dice finish first
@@ -4952,6 +5168,10 @@ class DICE_OT_add_from_preset(bpy.types.Operator):
                 elif prop_name in ['bar_indicator_height', 'bar_indicator_width', 'bar_indicator_space', 'center_bar']:
                     supports_indicators = supports_number_indicators(self.dice_type, self.num_faces)
                     if self.add_numbers and supports_indicators and self.number_indicator_type == 'bar':
+                        layout.prop(self, prop_name)
+                elif prop_name in ['dot_indicator_scale', 'dot_indicator_space']:
+                    supports_indicators = supports_number_indicators(self.dice_type, self.num_faces)
+                    if self.add_numbers and supports_indicators and self.number_indicator_type == 'dot':
                         layout.prop(self, prop_name)
                 else:
                     layout.prop(self, prop_name)
@@ -4994,8 +5214,12 @@ class DICE_OT_add_from_preset(bpy.types.Operator):
         self.bar_indicator_width = presets.bar_indicator_width
         self.bar_indicator_space = presets.bar_indicator_space
         self.center_bar = presets.center_bar
+        self.dot_indicator_scale = presets.dot_indicator_scale
+        self.dot_indicator_space = presets.dot_indicator_space
         self.custom_image_path = presets.custom_image_path
         self.custom_image_scale = presets.custom_image_scale
+        self.use_critical_face_material = presets.use_critical_face_material
+        self.critical_face_material = presets.critical_face_material
         self.number_center_offset = presets.number_center_offset
         self.base_height = presets.base_height
         self.point_height = presets.point_height
@@ -5119,9 +5343,9 @@ class DICE_OT_add_from_preset(bpy.types.Operator):
         settings_values["font_path"] = font_path
         settings_values["custom_image_path"] = custom_image_path
 
-        numbers_object = None
+        numbers_objects = []
         if self.add_numbers:
-            numbers_object = create_numbers_object_for_mesh(
+            numbers_objects = create_numbers_object_for_mesh(
                 context,
                 mesh,
                 self.size,
@@ -5138,11 +5362,18 @@ class DICE_OT_add_from_preset(bpy.types.Operator):
                 custom_image_face=self.custom_image_face,
                 custom_image_path=custom_image_path,
                 custom_image_scale=self.custom_image_scale,
+                use_critical_face_material=self.use_critical_face_material,
+                critical_face_material=self.critical_face_material,
+                dot_indicator_scale=self.dot_indicator_scale,
+                dot_indicator_space=self.dot_indicator_space,
             )
 
-            if numbers_object is not None:
-                numbers_object.name = "dice_numbers"
-                apply_boolean_modifier(dice_obj, numbers_object)
+            for idx, num_obj in enumerate(numbers_objects):
+                num_obj.name = "dice_numbers" if idx == 0 else "dice_numbers_critical"
+                mod_name = 'boolean' if idx == 0 else 'boolean_critical'
+                remember = 'dice_numbers_name' if idx == 0 else 'dice_critical_numbers_name'
+                apply_boolean_modifier(dice_obj, num_obj, modifier_name=mod_name, remember_key=remember)
+                num_obj["dice_body_name"] = dice_obj.name
 
         fin_support_object = generate_fin_supports(
             context,
@@ -5155,21 +5386,22 @@ class DICE_OT_add_from_preset(bpy.types.Operator):
             self.report({'WARNING'}, "Could not build fin supports for this die.")
 
         # Store metadata
-        target_object = numbers_object or dice_obj
+        target_object = numbers_objects[0] if numbers_objects else dice_obj
         dice_obj["dice_gen_type"] = mesh_class.__name__
         target_object["dice_gen_type"] = mesh_class.__name__
-        if numbers_object is not None:
-            numbers_object["dice_body_name"] = dice_obj.name
 
         # Store settings on the object
         apply_settings(dice_obj.dice_gen_settings, settings_values)
         apply_settings(target_object.dice_gen_settings, settings_values)
 
         dice_collection = create_dice_collection(context, get_dice_type_label(self.dice_type))
+        extra_objs = list(numbers_objects)
+        if fin_support_object is not None:
+            extra_objs.append(fin_support_object)
         organize_dice_objects_in_collection(
             dice_obj,
             dice_collection,
-            extra_objects=[numbers_object, fin_support_object],
+            extra_objects=extra_objs,
         )
 
         return {'FINISHED'}
@@ -5207,6 +5439,9 @@ class VIEW3D_PT_dice_gen_sidebar(bpy.types.Panel):
             box.prop(presets, "number_scale")
             box.prop(presets, "number_depth")
             box.prop(presets, "font_path")
+            box.prop(presets, "use_critical_face_material")
+            if presets.use_critical_face_material:
+                box.prop(presets, "critical_face_material")
 
             box.label(text="Number Indicators:")
             box.prop(presets, "number_indicator_type")
@@ -5218,6 +5453,9 @@ class VIEW3D_PT_dice_gen_sidebar(bpy.types.Panel):
                 box.prop(presets, "bar_indicator_width")
                 box.prop(presets, "bar_indicator_space")
                 box.prop(presets, "center_bar")
+            elif presets.number_indicator_type == NUMBER_IND_DOT:
+                box.prop(presets, "dot_indicator_scale")
+                box.prop(presets, "dot_indicator_space")
 
         # Custom Image Settings
         box = layout.box()

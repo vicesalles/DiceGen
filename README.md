@@ -39,6 +39,8 @@ The add-on will create a blank dice mesh and, if enabled, a separate numbers obj
 - Added new Dice Gen sidebar menu option to allow quickly creating multiple dice with the same configuration
 - Built-in fin supports for resin printing
 - Automatic per-die collections to keep multi-die scenes organized
+- Dedicated critical face material: assign a distinct material to the highest-value face label
+- Dot orientation indicator: place a small dot below `6` and `9` for visual clarity
 
 ## Settings reference
 
