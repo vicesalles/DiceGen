@@ -4576,6 +4576,17 @@ def _rename_object_and_data(obj: bpy.types.Object, new_name: str) -> None:
         obj.data.name = new_name
 
 
+def _compute_critical_value(numbers: List[str]) -> Optional[int]:
+    """Return the highest parseable integer value from a list of number strings."""
+    best = None
+    for txt in numbers:
+        v = _parse_face_value(txt)
+        if v is not None:
+            if best is None or v > best:
+                best = v
+    return best
+
+
 def _build_export_metadata(mesh_instance, body_obj: bpy.types.Object, die_type: str, asset_file: str = "") -> str:
     """
     Build a JSON metadata string describing the relationship between die
@@ -4598,6 +4609,8 @@ def _build_export_metadata(mesh_instance, body_obj: bpy.types.Object, die_type: 
     if not mesh_data or not hasattr(mesh_data, 'polygons'):
         return ""
 
+    critical_value = _compute_critical_value(numbers)
+
     # ------------------------------------------------------------------
     # D4 (Tetrahedron) — vertex-oriented labels, result = value at the
     # upward-pointing vertex. Export explicit result orientations.
@@ -4608,10 +4621,10 @@ def _build_export_metadata(mesh_instance, body_obj: bpy.types.Object, die_type: 
         if not vertices or not faces:
             return ""
 
-        # Build face normals from the Blender mesh (already in local space)
+        # Build face normals from the Blender mesh (already normalized)
         face_normals: List[Vector] = []
         for poly in mesh_data.polygons:
-            face_normals.append(Vector(poly.normal))
+            face_normals.append(Vector(poly.normal).normalized())
 
         # Map each value to the vertex it is placed near.
         # From get_number_locations(), the 12 numbers are grouped by vertex:
@@ -4619,13 +4632,8 @@ def _build_export_metadata(mesh_instance, body_obj: bpy.types.Object, die_type: 
         #   indices 3,4,5  → vertex 1 (value 2)
         #   indices 6,7,8  → vertex 0 (value 3)
         #   indices 9,10,11→ vertex 3 (value 4)
-        # face_info in get_number_locations() encodes (face_idx, target_vert).
-        # We derive the vertex mapping from that structure.
         vertex_for_number = [2, 2, 2, 1, 1, 1, 0, 0, 0, 3, 3, 3]
 
-        # For each vertex, find the opposite face (the face that does NOT
-        # contain that vertex). When the die rests on that face, the vertex
-        # points up.
         def _opposite_face(vertex_idx: int) -> int:
             for f_idx, face in enumerate(faces):
                 if vertex_idx not in face:
@@ -4639,63 +4647,69 @@ def _build_export_metadata(mesh_instance, body_obj: bpy.types.Object, die_type: 
                 value = numbers[num_idx]
                 if value not in value_labels:
                     value_labels[value] = []
-                up = [0.0, 1.0, 0.0]
+                up_vec = Vector((0.0, 1.0, 0.0))
                 if num_idx < len(rotations):
                     rot = Euler(rotations[num_idx])
-                    up_vec = Vector((0.0, 1.0, 0.0))
                     up_vec.rotate(rot)
-                    up = [round(up_vec.x, 6), round(up_vec.y, 6), round(up_vec.z, 6)]
+                    up_vec.normalize()
                 face_idx = face_indices[num_idx] - 1 if face_indices and num_idx < len(face_indices) and face_indices[num_idx] > 0 else -1
                 value_labels[value].append({
                     "face_index": face_idx,
-                    "up": up
+                    "up": [round(up_vec.x, 6), round(up_vec.y, 6), round(up_vec.z, 6)]
                 })
 
         results: List[Dict[str, Any]] = []
         for value in sorted(value_labels.keys(), key=lambda x: int(x) if x.isdigit() else 0):
-            # Find the representative vertex for this value (all 3 instances share the same vertex)
             rep_num_idx = numbers.index(value) if value in numbers else 0
             up_vertex = vertex_for_number[rep_num_idx] if rep_num_idx < len(vertex_for_number) else 0
             resting_face = _opposite_face(up_vertex)
-            resting_normal = [round(face_normals[resting_face].x, 6),
-                              round(face_normals[resting_face].y, 6),
-                              round(face_normals[resting_face].z, 6)] if resting_face < len(face_normals) else [0.0, 0.0, -1.0]
+            resting_normal_vec = face_normals[resting_face] if resting_face < len(face_normals) else Vector((0.0, 0.0, -1.0))
+            resting_normal = [round(resting_normal_vec.x, 6), round(resting_normal_vec.y, 6), round(resting_normal_vec.z, 6)]
 
             # Compute a rotation that aligns the resting face normal with world down (0,0,-1).
-            # This gives one valid orientation for this result. The spin around the vertical
-            # axis is arbitrary and not defined by the generator.
-            local_normal = face_normals[resting_face] if resting_face < len(face_normals) else Vector((0.0, 0.0, -1.0))
-            rot_quat = Vector((0.0, 0.0, -1.0)).rotation_difference(local_normal)
+            rot_quat = Vector((0.0, 0.0, -1.0)).rotation_difference(resting_normal_vec)
             rot_euler = rot_quat.to_euler()
-            local_rotation = [round(rot_euler.x, 6), round(rot_euler.y, 6), round(rot_euler.z, 6)]
+            local_rotation_euler = [round(rot_euler.x, 6), round(rot_euler.y, 6), round(rot_euler.z, 6)]
+            local_rotation_quat = [round(rot_quat.w, 6), round(rot_quat.x, 6), round(rot_quat.y, 6), round(rot_quat.z, 6)]
 
             vert_pos = vertices[up_vertex] if up_vertex < len(vertices) else (0.0, 0.0, 0.0)
+            value_int = int(value) if value.isdigit() else None
 
-            results.append({
+            result_entry: Dict[str, Any] = {
                 "value": value,
-                "convention": "vertex_up",
+                "value_convention": "vertex_up",
                 "up_vertex": up_vertex,
                 "up_vertex_position": [round(vert_pos[0], 6), round(vert_pos[1], 6), round(vert_pos[2], 6)],
                 "resting_face": resting_face,
                 "resting_face_normal": resting_normal,
-                "local_rotation": local_rotation,
+                "local_rotation_euler": local_rotation_euler,
+                "local_rotation_quat": local_rotation_quat,
                 "label_instances": value_labels.get(value, [])
-            })
+            }
+            if value_int is not None:
+                result_entry["value_int"] = value_int
+            results.append(result_entry)
 
         metadata: Dict[str, Any] = {
+            "schema_version": "1.0.0",
             "die_type": "d4",
             "asset_origin": "geometric_center",
             "asset_file": asset_file,
+            "coordinate_system": "right_handed_y_up",
+            "rotation_units": "radians",
+            "value_convention": "vertex_up",
             "results": results,
             "notes": (
                 "Tetrahedral D4 with vertex-oriented labels. "
                 "Each of the 4 values is printed near one vertex on all 3 adjacent faces. "
                 "The 'vertex_up' convention assumes the result is the value at the upward-pointing vertex. "
-                "local_rotation aligns the resting face normal with world down (0,0,-1); "
+                "local_rotation_euler / local_rotation_quat align the resting face normal with world down (0,0,-1); "
                 "spin around the vertical axis is not defined by the generator. "
                 "For deterministic rolling, the resting face is the one opposite the upright vertex."
             )
         }
+        if critical_value is not None:
+            metadata["critical_value"] = critical_value
         return json.dumps(metadata, indent=2)
 
     # ------------------------------------------------------------------
@@ -4703,10 +4717,11 @@ def _build_export_metadata(mesh_instance, body_obj: bpy.types.Object, die_type: 
     # ------------------------------------------------------------------
     faces_meta: List[Dict[str, Any]] = []
     for poly in mesh_data.polygons:
+        normal_vec = Vector(poly.normal).normalized()
         faces_meta.append({
             "face_index": poly.index,
             "center": [round(poly.center.x, 6), round(poly.center.y, 6), round(poly.center.z, 6)],
-            "normal": [round(poly.normal.x, 6), round(poly.normal.y, 6), round(poly.normal.z, 6)],
+            "normal": [round(normal_vec.x, 6), round(normal_vec.y, 6), round(normal_vec.z, 6)],
             "values": []
         })
 
@@ -4719,24 +4734,33 @@ def _build_export_metadata(mesh_instance, body_obj: bpy.types.Object, die_type: 
                 continue
 
             value = numbers[num_idx] if num_idx < len(numbers) else "N/A"
-            up = [0.0, 1.0, 0.0]
+            up_vec = Vector((0.0, 1.0, 0.0))
             if num_idx < len(rotations):
                 rot = Euler(rotations[num_idx])
-                up_vec = Vector((0.0, 1.0, 0.0))
                 up_vec.rotate(rot)
-                up = [round(up_vec.x, 6), round(up_vec.y, 6), round(up_vec.z, 6)]
+                up_vec.normalize()
 
-            faces_meta[face_data_idx]["values"].append({
+            value_int = int(value) if value.isdigit() else None
+            value_entry: Dict[str, Any] = {
                 "value": value,
-                "up": up
-            })
+                "up": [round(up_vec.x, 6), round(up_vec.y, 6), round(up_vec.z, 6)]
+            }
+            if value_int is not None:
+                value_entry["value_int"] = value_int
+            faces_meta[face_data_idx]["values"].append(value_entry)
 
-    metadata = {
+    metadata: Dict[str, Any] = {
+        "schema_version": "1.0.0",
         "die_type": die_type.lower().replace("_", ""),
         "asset_origin": "geometric_center",
         "asset_file": asset_file,
+        "coordinate_system": "right_handed_y_up",
+        "rotation_units": "radians",
+        "value_convention": "face_up",
         "faces": faces_meta
     }
+    if critical_value is not None:
+        metadata["critical_value"] = critical_value
     return json.dumps(metadata, indent=2)
 
 
