@@ -23,6 +23,41 @@ bl_info = {
     'tracker_url': 'https://github.com/Longi94/blender-dice-gen/issues'
 }
 
+def _discover_system_font() -> str:
+    """
+    Return the path to a usable system TTF/OTF font, or empty string if none found.
+    Falls back gracefully so Blender's built-in font is used when no system font exists.
+    """
+    candidates = []
+    if os.name == 'nt':
+        font_dir = os.path.join(os.environ.get('WINDIR', 'C:\\Windows'), 'Fonts')
+        candidates = [
+            os.path.join(font_dir, 'arial.ttf'),
+            os.path.join(font_dir, 'segoeui.ttf'),
+            os.path.join(font_dir, 'calibri.ttf'),
+            os.path.join(font_dir, 'verdana.ttf'),
+            os.path.join(font_dir, 'tahoma.ttf'),
+        ]
+    elif os.uname().sysname == 'Darwin':
+        candidates = [
+            '/System/Library/Fonts/Helvetica.ttc',
+            '/Library/Fonts/Arial.ttf',
+            '/System/Library/Fonts/Supplemental/Arial.ttf',
+        ]
+    else:
+        candidates = [
+            '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',
+            '/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf',
+            '/usr/share/fonts/truetype/freefont/FreeSans.ttf',
+        ]
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+    return ''
+
+
+DEFAULT_SYSTEM_FONT = _discover_system_font()
+
 NUMBER_IND_NONE = 'none'
 NUMBER_IND_BAR = 'bar'
 NUMBER_IND_PERIOD = 'period'
@@ -2196,8 +2231,23 @@ SETTINGS_ATTRS = [
 ]
 
 
+def _sanitize_setting_value(value):
+    """Convert RNA property arrays to plain Python tuples to avoid stale references."""
+    if isinstance(value, str):
+        return value
+    if hasattr(value, '__iter__') and hasattr(value, '__len__'):
+        try:
+            return tuple(value)
+        except TypeError:
+            pass
+    return value
+
+
 def collect_settings_from_op(op, settings_template):
-    return {attr: getattr(op, attr, getattr(settings_template, attr)) for attr in SETTINGS_ATTRS}
+    return {
+        attr: _sanitize_setting_value(getattr(op, attr, getattr(settings_template, attr)))
+        for attr in SETTINGS_ATTRS
+    }
 
 
 def apply_settings(settings_obj, values):
@@ -2206,7 +2256,7 @@ def apply_settings(settings_obj, values):
 
 
 def snapshot_settings(settings_obj):
-    return {attr: getattr(settings_obj, attr) for attr in SETTINGS_ATTRS}
+    return {attr: _sanitize_setting_value(getattr(settings_obj, attr)) for attr in SETTINGS_ATTRS}
 
 
 def resolve_settings_owner(obj):
@@ -3120,7 +3170,7 @@ def create_numbers(context, numbers, locations, rotations, font_path, font_size,
     if len(number_objs):
         numbers = join(number_objs)
         apply_transform(numbers, use_rotation=True, use_location=True)
-        numbers_material = ensure_material(material_name, material_color)
+        numbers_material = ensure_material(material_name, tuple(material_color))
         assign_material(numbers, numbers_material)
         return numbers
 
@@ -3178,12 +3228,40 @@ def create_number(context, number, font_path, font_size, number_depth, location,
     return mesh_object
 
 
+def _normalize_die_type(dice_type: str) -> str:
+    """Map internal class names or operator enum values to a canonical type string."""
+    class_map = {
+        'Tetrahedron': 'D4',
+        'D4Crystal': 'D4_CRYSTAL',
+        'D4Shard': 'D4_SHARD',
+        'Cube': 'D6',
+        'Octahedron': 'D8',
+        'D10Mesh': 'D10',
+        'D100Mesh': 'D100',
+        'Dodecahedron': 'D12',
+        'Icosahedron': 'D20',
+        'CustomCrystal': 'CUSTOM_CRYSTAL',
+        'CustomShard': 'CUSTOM_SHARD',
+        'CustomBipyramid': 'CUSTOM_BIPYRAMID',
+        'CustomTrapezohedron': 'CUSTOM_TRAP',
+    }
+    return class_map.get(dice_type, dice_type)
+
+
 def supports_number_indicators(dice_type: str, num_faces: int) -> bool:
-    return dice_type in ['D6', 'D8', 'D10', 'D12', 'D20', 'D100'] or (
-        dice_type == 'CUSTOM_TRAP' and num_faces >= 9
-    ) or (
-        dice_type in ['CUSTOM_CRYSTAL', 'CUSTOM_SHARD', 'CUSTOM_BIPYRAMID'] and num_faces >= 6
-    )
+    """
+    Return True only for dice types that contain both '6' and '9' faces,
+    since orientation indicators exist solely to disambiguate those two values.
+    """
+    t = _normalize_die_type(dice_type)
+    # Standard dice that have both 6 and 9 in their number range
+    if t in ['D10', 'D12', 'D20', 'D100']:
+        return True
+    # Custom dice generate numbers 1..num_faces, so we need at least 9 faces
+    # to guarantee both 6 and 9 exist.
+    if t in ['CUSTOM_TRAP', 'CUSTOM_CRYSTAL', 'CUSTOM_SHARD', 'CUSTOM_BIPYRAMID']:
+        return num_faces >= 9
+    return False
 
 
 def _polygon_area_2d(points: List[Vector]) -> float:
@@ -3559,6 +3637,18 @@ def get_highest_value_face_index(mesh: Mesh) -> int:
             best_value = parsed_value
             best_face = face_idx
 
+    # D10 / D100 convention: '0' (or '00') represents the highest value (10 / 100),
+    # but _parse_face_value reads it as integer 0. Correct the critical face.
+    d10_zero_fix = ('0' in numbers and best_value == 9)
+    d100_zero_fix = ('00' in numbers and best_value == 90)
+    if d10_zero_fix or d100_zero_fix:
+        target_text = '0' if d10_zero_fix else '00'
+        for number_idx, number_text in enumerate(numbers):
+            if number_text == target_text:
+                face_idx = number_face_map[number_idx] if number_idx < len(number_face_map) else 0
+                if face_idx > 0:
+                    return face_idx
+
     return best_face
 
 
@@ -3600,6 +3690,18 @@ def create_numbers_object_for_mesh(context,
         highest_face = get_highest_value_face_index(mesh)
         if highest_face > 0:
             critical_indices_set = set(get_number_indices_for_face(mesh, highest_face))
+
+        # D4 Tetrahedron special case: numbers are vertex-oriented (each value
+        # appears on 3 different faces). Instead of painting an entire face
+        # (which would paint 3 different numbers), paint every instance of the
+        # highest numeric value across the die.
+        if isinstance(mesh, Tetrahedron):
+            numeric_values = [(_parse_face_value(txt), txt, idx)
+                              for idx, txt in enumerate(all_numbers)]
+            numeric_values = [(v, txt, idx) for v, txt, idx in numeric_values if v is not None]
+            if numeric_values:
+                max_value = max(v for v, _, _ in numeric_values)
+                critical_indices_set = {idx for v, _, idx in numeric_values if v == max_value}
 
     if include_indices is None:
         indices = list(range(len(all_numbers)))
@@ -3672,7 +3774,7 @@ def create_numbers_object_for_mesh(context,
             custom_image_path=custom_image_path,
             custom_image_scale=custom_image_scale,
             original_indices=critical_indices,
-            material_name="Dice Critical Face",
+            material_name="Critical Number",
             material_color=critical_face_material,
             dot_indicator_scale=dot_indicator_scale,
             dot_indicator_space=dot_indicator_space,
@@ -3835,17 +3937,19 @@ def execute_generator(op, context, mesh_cls, name: str, **kwargs) -> Dict[str, s
             custom_image_face=op.custom_image_face, custom_image_path=op.custom_image_path,
             custom_image_scale=op.custom_image_scale,
             use_critical_face_material=getattr(op, "use_critical_face_material", False),
-            critical_face_material=getattr(op, "critical_face_material", (1.0, 0.0, 0.0, 1.0)),
+            critical_face_material=tuple(getattr(op, "critical_face_material", (1.0, 0.0, 0.0, 1.0))),
             dot_indicator_scale=getattr(op, "dot_indicator_scale", 1),
             dot_indicator_space=getattr(op, "dot_indicator_space", 1),
         )
 
-    target_object = numbers_objects[0] if numbers_objects else die_obj
-    target_object["dice_gen_type"] = mesh_cls.__name__
+    # Always tag the body so export/update can find it
+    die_obj["dice_gen_type"] = mesh_cls.__name__
+    apply_settings(die_obj.dice_gen_settings, settings_values)
+
     for num_obj in numbers_objects:
         num_obj["dice_body_name"] = die_obj.name
-
-    apply_settings(target_object.dice_gen_settings, settings_values)
+        num_obj["dice_gen_type"] = mesh_cls.__name__
+        apply_settings(num_obj.dice_gen_settings, settings_values)
 
     return {'FINISHED'}
 
@@ -4012,7 +4116,8 @@ FontPathProperty = StringProperty(
     name='Font',
     description='Number font (TTF or OTF)',
     maxlen=1024,
-    subtype='FILE_PATH'
+    subtype='FILE_PATH',
+    default=DEFAULT_SYSTEM_FONT
 )
 
 CustomImagePathProperty = StringProperty(
@@ -4390,6 +4495,292 @@ class DiceGenSettings(bpy.types.PropertyGroup):
 
 
 # ============================================================================
+# UNITY-READY EXPORT WORKFLOW
+# ============================================================================
+
+UNITY_MATERIAL_MAP = {
+    "Dice Body": "MAT_Die_Body",
+    "Dice Numbers": "MAT_Die_Label",
+    "Critical Number": "MAT_Die_Label_Critical",
+    "Dice Supports": "MAT_Die_Support",
+    "Dice Panels": "MAT_Die_Panel",
+}
+
+
+def _get_unity_type_label(body_obj: bpy.types.Object) -> str:
+    """Resolve a clean dice type string from object metadata."""
+    die_type = body_obj.get("dice_gen_type", "")
+    if not die_type:
+        return "Unknown"
+    # Map internal class names to user-friendly labels
+    label_map = {
+        "Tetrahedron": "D4",
+        "D4Crystal": "D4_Crystal",
+        "D4Shard": "D4_Shard",
+        "CustomCrystal": "Custom_Crystal",
+        "CustomShard": "Custom_Shard",
+        "CustomBipyramid": "Custom_Bipyramid",
+        "CustomTrapezohedron": "Custom_Trap",
+        "Cube": "D6",
+        "Octahedron": "D8",
+        "D10Mesh": "D10",
+        "D100Mesh": "D100",
+        "Dodecahedron": "D12",
+        "Icosahedron": "D20",
+    }
+    return label_map.get(die_type, die_type)
+
+
+def _rename_materials_for_unity(obj: bpy.types.Object) -> None:
+    """Rename materials on the object to Unity-friendly names."""
+    for slot in obj.material_slots:
+        if slot.material and slot.material.name in UNITY_MATERIAL_MAP:
+            slot.material.name = UNITY_MATERIAL_MAP[slot.material.name]
+
+
+def _duplicate_object(obj: bpy.types.Object) -> Optional[bpy.types.Object]:
+    """Duplicate an object in the view layer and return the copy."""
+    view_layer = bpy.context.view_layer
+    previous_active = view_layer.objects.active
+
+    for ob in view_layer.objects:
+        ob.select_set(False)
+    obj.select_set(True)
+    view_layer.objects.active = obj
+
+    bpy.ops.object.duplicate()
+    copy = view_layer.objects.active
+
+    view_layer.objects.active = previous_active
+    if copy is None or copy == obj:
+        return None
+    return copy
+
+
+def _remove_boolean_modifiers(obj: bpy.types.Object) -> None:
+    """Remove all BOOLEAN modifiers from an object."""
+    for modifier in list(obj.modifiers):
+        if modifier.type == 'BOOLEAN':
+            obj.modifiers.remove(modifier)
+
+
+def _rename_object_and_data(obj: bpy.types.Object, new_name: str) -> None:
+    """Rename an object and its mesh data block."""
+    obj.name = new_name
+    if obj.data:
+        obj.data.name = new_name
+
+
+def _prepare_unity_export_set(body_obj: bpy.types.Object) -> List[bpy.types.Object]:
+    """
+    Create temporary export copies of the dice body and all its associated
+    number/critical pieces. Removes boolean modifiers from the body so it
+    stays solid, applies transforms, renames everything Unity-friendly, and
+    renames materials to MAT_* conventions.
+
+    Returns a list of export-ready objects (body, numbers, critical).
+    """
+    if body_obj is None or body_obj.type != 'MESH':
+        return []
+
+    dice_type = _get_unity_type_label(body_obj)
+    export_objects: List[bpy.types.Object] = []
+
+    # --- Body ---
+    body_copy = _duplicate_object(body_obj)
+    if body_copy is None:
+        return []
+    _remove_boolean_modifiers(body_copy)
+    apply_transform(body_copy, use_location=True, use_rotation=True, use_scale=True)
+    _rename_object_and_data(body_copy, f"GG_{dice_type}_Body")
+    _rename_materials_for_unity(body_copy)
+    export_objects.append(body_copy)
+
+    # --- Numbers (regular) ---
+    numbers_name = body_obj.get("dice_numbers_name")
+    if numbers_name:
+        numbers_obj = bpy.data.objects.get(numbers_name)
+        if numbers_obj and numbers_obj.type == 'MESH':
+            num_copy = _duplicate_object(numbers_obj)
+            if num_copy:
+                apply_transform(num_copy, use_location=True, use_rotation=True, use_scale=True)
+                _rename_object_and_data(num_copy, f"GG_{dice_type}_Numbers")
+                _rename_materials_for_unity(num_copy)
+                export_objects.append(num_copy)
+
+    # --- Critical numbers ---
+    critical_name = body_obj.get("dice_critical_numbers_name")
+    if critical_name:
+        critical_obj = bpy.data.objects.get(critical_name)
+        if critical_obj and critical_obj.type == 'MESH':
+            crit_copy = _duplicate_object(critical_obj)
+            if crit_copy:
+                apply_transform(crit_copy, use_location=True, use_rotation=True, use_scale=True)
+                _rename_object_and_data(crit_copy, f"GG_{dice_type}_Numbers_Critical")
+                _rename_materials_for_unity(crit_copy)
+                export_objects.append(crit_copy)
+
+    return export_objects
+
+
+def _export_objects_fbx(objects: List[bpy.types.Object], filepath: str) -> bool:
+    """Export multiple objects to a single FBX file."""
+    if not objects:
+        return False
+
+    view_layer = bpy.context.view_layer
+    previous_active = view_layer.objects.active
+
+    for ob in view_layer.objects:
+        ob.select_set(False)
+    for ob in objects:
+        ob.select_set(True)
+    view_layer.objects.active = objects[0]
+
+    try:
+        bpy.ops.export_scene.fbx(
+            filepath=filepath,
+            use_selection=True,
+            apply_unit_scale=True,
+            apply_scale_options='FBX_SCALE_ALL',
+            axis_forward='-Z',
+            axis_up='Y',
+            bake_space_transform=True,
+            mesh_smooth_type='OFF',
+            use_mesh_edges=False,
+            use_tspace=False,
+            use_custom_props=False,
+            add_leaf_bones=False,
+            use_armature_deform_only=False,
+        )
+        success = True
+    except RuntimeError:
+        success = False
+
+    view_layer.objects.active = previous_active
+    return success
+
+
+class DICE_OT_export_unity_ready(bpy.types.Operator):
+    """Export selected dice bodies as Unity-ready FBX meshes.
+    Exports the body, regular numbers, and critical numbers as separate
+    objects with Unity-friendly material names (MAT_Die_Body,
+    MAT_Die_Label, MAT_Die_Label_Critical) so they can be customized
+    individually in Unity."""
+    bl_idname = "dicegen.export_unity_ready"
+    bl_label = "Export Unity-Ready FBX"
+    bl_options = {'REGISTER'}
+
+    export_format: EnumProperty(
+        name="Format",
+        items=(
+            ('FBX', 'FBX', 'Autodesk FBX'),
+            ('GLB', 'glTF Binary', 'glTF 2.0 Binary'),
+        ),
+        default='FBX',
+    )
+
+    def execute(self, context):
+        selected = list(context.selected_objects)
+        if not selected:
+            self.report({'WARNING'}, "No objects selected. Select dice bodies to export.")
+            return {'CANCELLED'}
+
+        # Resolve candidates: selected meshes that are dice bodies (have dice_gen_type
+        # but NOT dice_body_name — the latter marks number cutter objects).
+        candidates = [ob for ob in selected if ob.type == 'MESH'
+                      and ob.get("dice_gen_type") is not None
+                      and ob.get("dice_body_name") is None]
+        if not candidates:
+            self.report({'WARNING'}, "No valid dice bodies selected. Make sure you select the die body (not the number cutters).")
+            return {'CANCELLED'}
+
+        if not bpy.data.filepath:
+            self.report({'ERROR'}, "Save your .blend file first so the exporter knows where to write.")
+            return {'CANCELLED'}
+
+        base_dir = bpy.path.abspath("//exports/unity/")
+        exported = 0
+        failed = 0
+
+        all_temp_objects: List[bpy.types.Object] = []
+
+        for body_obj in candidates:
+            dice_type = _get_unity_type_label(body_obj)
+            type_dir = os.path.join(base_dir, dice_type.lower().replace("_", ""))
+            os.makedirs(type_dir, exist_ok=True)
+
+            export_set = _prepare_unity_export_set(body_obj)
+            if not export_set:
+                failed += 1
+                continue
+
+            all_temp_objects.extend(export_set)
+
+            filename = f"grangol_{dice_type.lower()}_default"
+            if self.export_format == 'FBX':
+                filepath = os.path.join(type_dir, filename + ".fbx")
+                ok = _export_objects_fbx(export_set, filepath)
+            else:
+                filepath = os.path.join(type_dir, filename + ".glb")
+                ok = self._export_objects_glb(export_set, filepath)
+
+            if ok:
+                exported += 1
+                self.report({'INFO'}, f"Exported: {filepath} ({len(export_set)} objects)")
+            else:
+                failed += 1
+                self.report({'ERROR'}, f"Failed to export: {filepath}")
+
+        # Clean up temporary export objects
+        for temp_obj in all_temp_objects:
+            if temp_obj.name in bpy.data.objects:
+                mesh_data = temp_obj.data
+                bpy.data.objects.remove(temp_obj, do_unlink=True)
+                if mesh_data and mesh_data.users == 0:
+                    bpy.data.meshes.remove(mesh_data)
+
+        # Re-select original selection
+        for ob in selected:
+            if ob.name in context.view_layer.objects:
+                ob.select_set(True)
+
+        if exported == 0:
+            self.report({'ERROR'}, "Export failed for all selected dice.")
+            return {'CANCELLED'}
+
+        self.report({'INFO'}, f"Exported {exported} dice ({failed} failed). Output: {base_dir}")
+        return {'FINISHED'}
+
+    def _export_objects_glb(self, objects: List[bpy.types.Object], filepath: str) -> bool:
+        if not objects:
+            return False
+
+        view_layer = bpy.context.view_layer
+        previous_active = view_layer.objects.active
+
+        for ob in view_layer.objects:
+            ob.select_set(False)
+        for ob in objects:
+            ob.select_set(True)
+        view_layer.objects.active = objects[0]
+
+        try:
+            bpy.ops.export_scene.gltf(
+                filepath=filepath,
+                use_selection=True,
+                export_format='GLB',
+                export_yup=True,
+            )
+            success = True
+        except RuntimeError:
+            success = False
+
+        view_layer.objects.active = previous_active
+        return success
+
+
+# ============================================================================
 # OLD OPERATOR CLASSES - REMOVED
 # All dice generation now uses DICE_OT_add_from_preset operator
 # The individual operator classes (DiceGeneratorBase, D4Generator, D6Generator, etc.)
@@ -4691,6 +5082,12 @@ class OBJECT_PT_dice_gen(bpy.types.Panel):
             box.prop(settings, "fin_support_raft_margin")
             box.prop(settings, "fin_support_raft_thickness")
             box.prop(settings, "fin_support_raft_taper")
+
+        layout.separator()
+        box = layout.box()
+        box.label(text="Unity Export", icon='EXPORT')
+        box.operator("dicegen.export_unity_ready", text="Export Selected as FBX")
+        box.label(text="Output: //exports/unity/")
 
         layout.separator()
         layout.operator("object.dice_gen_update", text="Regenerate Dice", icon='FILE_REFRESH')
@@ -5087,6 +5484,12 @@ class DICE_OT_add_from_preset(bpy.types.Operator):
         layout = self.layout
 
         # Define which properties are relevant for each dice type
+        _indicator_props = [
+            'number_indicator_type', 'period_indicator_scale', 'period_indicator_space',
+            'bar_indicator_height', 'bar_indicator_width', 'bar_indicator_space', 'center_bar',
+            'dot_indicator_scale', 'dot_indicator_space',
+        ]
+
         property_relevance = {
             'D4': ['size', 'number_center_offset', 'add_numbers', 'number_scale', 'number_depth',
                    'number_h_offset', 'number_v_offset', 'font_path', 'custom_image_path', 'custom_image_face', 'custom_image_scale', 'use_critical_face_material', 'critical_face_material'],
@@ -5096,46 +5499,31 @@ class DICE_OT_add_from_preset(bpy.types.Operator):
                         'add_numbers', 'number_scale', 'number_depth', 'number_h_offset', 'number_v_offset', 'font_path',
                         'custom_image_path', 'custom_image_face', 'custom_image_scale', 'use_critical_face_material', 'critical_face_material'],
             'D6': ['size', 'add_numbers', 'number_scale', 'number_depth', 'number_h_offset', 'number_v_offset', 'font_path',
-                   'number_indicator_type', 'period_indicator_scale', 'period_indicator_space',
-                   'bar_indicator_height', 'bar_indicator_width', 'bar_indicator_space', 'center_bar',
-                   'dot_indicator_scale', 'dot_indicator_space',
                    'custom_image_path', 'custom_image_face', 'custom_image_scale', 'use_critical_face_material', 'critical_face_material'],
             'D8': ['size', 'add_numbers', 'number_scale', 'number_depth', 'number_h_offset', 'number_v_offset', 'font_path',
                    'custom_image_path', 'custom_image_face', 'custom_image_scale', 'use_critical_face_material', 'critical_face_material'],
             'D10': ['size', 'height', 'add_numbers', 'number_scale', 'number_depth', 'number_h_offset', 'number_v_offset',
-                   'font_path', 'custom_image_path', 'custom_image_face', 'custom_image_scale', 'use_critical_face_material', 'critical_face_material'],
+                   'font_path'] + _indicator_props +
+                   ['custom_image_path', 'custom_image_face', 'custom_image_scale', 'use_critical_face_material', 'critical_face_material'],
             'D100': ['size', 'height', 'add_numbers', 'number_scale', 'number_depth', 'number_h_offset', 'number_v_offset',
-                    'font_path', 'custom_image_path', 'custom_image_face', 'custom_image_scale', 'use_critical_face_material', 'critical_face_material'],
+                    'font_path'] + _indicator_props +
+                    ['custom_image_path', 'custom_image_face', 'custom_image_scale', 'use_critical_face_material', 'critical_face_material'],
             'CUSTOM_TRAP': ['size', 'num_faces', 'height', 'add_numbers', 'number_scale',
-                            'number_depth', 'number_h_offset', 'number_v_offset', 'font_path',
-                            'number_indicator_type', 'period_indicator_scale', 'period_indicator_space',
-                            'bar_indicator_height', 'bar_indicator_width', 'bar_indicator_space', 'center_bar',
-                            'dot_indicator_scale', 'dot_indicator_space',
-                            'custom_image_path', 'custom_image_face', 'custom_image_scale', 'use_critical_face_material', 'critical_face_material'],
-            'D12': ['size', 'add_numbers', 'number_scale', 'number_depth', 'number_h_offset', 'number_v_offset', 'font_path',
-                    'custom_image_path', 'custom_image_face', 'custom_image_scale', 'use_critical_face_material', 'critical_face_material'],
-            'D20': ['size', 'add_numbers', 'number_scale', 'number_depth', 'number_h_offset', 'number_v_offset', 'font_path',
-                    'number_indicator_type', 'period_indicator_scale', 'period_indicator_space',
-                    'dot_indicator_scale', 'dot_indicator_space',
-                    'custom_image_path', 'custom_image_face', 'custom_image_scale', 'use_critical_face_material', 'critical_face_material'],
+                            'number_depth', 'number_h_offset', 'number_v_offset', 'font_path'] + _indicator_props +
+                            ['custom_image_path', 'custom_image_face', 'custom_image_scale', 'use_critical_face_material', 'critical_face_material'],
+            'D12': ['size', 'add_numbers', 'number_scale', 'number_depth', 'number_h_offset', 'number_v_offset', 'font_path'] + _indicator_props +
+                    ['custom_image_path', 'custom_image_face', 'custom_image_scale', 'use_critical_face_material', 'critical_face_material'],
+            'D20': ['size', 'add_numbers', 'number_scale', 'number_depth', 'number_h_offset', 'number_v_offset', 'font_path'] + _indicator_props +
+                    ['custom_image_path', 'custom_image_face', 'custom_image_scale', 'use_critical_face_material', 'critical_face_material'],
             'CUSTOM_CRYSTAL': ['size', 'num_faces', 'base_height', 'top_point_height', 'bottom_point_height', 'add_numbers',
-                              'number_scale', 'number_depth', 'number_h_offset', 'number_v_offset', 'font_path',
-                              'number_indicator_type', 'period_indicator_scale', 'period_indicator_space',
-                              'bar_indicator_height', 'bar_indicator_width', 'bar_indicator_space', 'center_bar',
-                              'dot_indicator_scale', 'dot_indicator_space',
-                              'custom_image_path', 'custom_image_face', 'custom_image_scale', 'use_critical_face_material', 'critical_face_material'],
+                              'number_scale', 'number_depth', 'number_h_offset', 'number_v_offset', 'font_path'] + _indicator_props +
+                              ['custom_image_path', 'custom_image_face', 'custom_image_scale', 'use_critical_face_material', 'critical_face_material'],
             'CUSTOM_SHARD': ['size', 'num_faces', 'top_point_height', 'bottom_point_height',
-                            'add_numbers', 'number_scale', 'number_depth', 'number_h_offset', 'number_v_offset', 'font_path',
-                            'number_indicator_type', 'period_indicator_scale', 'period_indicator_space',
-                            'bar_indicator_height', 'bar_indicator_width', 'bar_indicator_space', 'center_bar',
-                            'dot_indicator_scale', 'dot_indicator_space',
-                            'custom_image_path', 'custom_image_face', 'custom_image_scale', 'use_critical_face_material', 'critical_face_material'],
+                            'add_numbers', 'number_scale', 'number_depth', 'number_h_offset', 'number_v_offset', 'font_path'] + _indicator_props +
+                            ['custom_image_path', 'custom_image_face', 'custom_image_scale', 'use_critical_face_material', 'critical_face_material'],
             'CUSTOM_BIPYRAMID': ['size', 'num_faces', 'top_point_height', 'bottom_point_height',
-                                'add_numbers', 'number_scale', 'number_depth', 'number_h_offset', 'number_v_offset', 'font_path',
-                                'number_indicator_type', 'period_indicator_scale', 'period_indicator_space',
-                                'bar_indicator_height', 'bar_indicator_width', 'bar_indicator_space', 'center_bar',
-                                'dot_indicator_scale', 'dot_indicator_space',
-                                'custom_image_path', 'custom_image_face', 'custom_image_scale', 'use_critical_face_material', 'critical_face_material'],
+                                'add_numbers', 'number_scale', 'number_depth', 'number_h_offset', 'number_v_offset', 'font_path'] + _indicator_props +
+                                ['custom_image_path', 'custom_image_face', 'custom_image_scale', 'use_critical_face_material', 'critical_face_material'],
         }
 
         # Always show dice finish first
@@ -5363,7 +5751,7 @@ class DICE_OT_add_from_preset(bpy.types.Operator):
                 custom_image_path=custom_image_path,
                 custom_image_scale=self.custom_image_scale,
                 use_critical_face_material=self.use_critical_face_material,
-                critical_face_material=self.critical_face_material,
+                critical_face_material=tuple(self.critical_face_material),
                 dot_indicator_scale=self.dot_indicator_scale,
                 dot_indicator_space=self.dot_indicator_space,
             )
@@ -5480,6 +5868,14 @@ class VIEW3D_PT_dice_gen_sidebar(bpy.types.Panel):
         # Dice Type Buttons
         layout.separator()
         box = layout.box()
+        box.label(text="Unity Export", icon='EXPORT')
+        box.label(text="Select dice bodies, then export:")
+        row = box.row()
+        row.operator("dicegen.export_unity_ready", text="Export Selected as FBX")
+        box.label(text="Output: //exports/unity/", icon='FILE_FOLDER')
+
+        layout.separator()
+        box = layout.box()
         box.label(text="Add Dice to Scene", icon='CUBE')
 
         col = box.column(align=True)
@@ -5544,6 +5940,7 @@ classes = [
     OBJECT_OT_dice_gen_update,
     OBJECT_PT_dice_gen,
     DICE_OT_add_from_preset,  # Single unified operator for all dice generation
+    DICE_OT_export_unity_ready,
     VIEW3D_PT_dice_gen_sidebar
 ]
 

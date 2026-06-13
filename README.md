@@ -41,6 +41,31 @@ The add-on will create a blank dice mesh and, if enabled, a separate numbers obj
 - Automatic per-die collections to keep multi-die scenes organized
 - Dedicated critical face material: assign a distinct material to the highest-value face label
 - Dot orientation indicator: place a small dot below `6` and `9` for visual clarity
+- Unity-ready FBX export: exports body, numbers, and critical face as separate objects with independent materials for easy customization
+- Automatic system font selection on first use (falls back to Blender built-in if none found)
+
+## Unity-ready export
+
+Select any generated dice body and click **Export Selected as FBX**. The button is available in two places:
+
+1. **Object Properties panel** (orange cube tab): select a die body, scroll to *Dice Gen*, and click *Export Selected as FBX* right next to *Regenerate Dice*.
+2. **N-panel sidebar**: press **N** in the 3D viewport, open the *DiceGen5* tab, and find *Unity Export* at the bottom.
+
+The exporter produces **multiple objects per die** so you can customize materials individually in Unity:
+
+| Object | Example name | Material | Purpose |
+|--------|-------------|----------|---------|
+| Body | `GG_D6_Body` | `MAT_Die_Body` | Solid die body (boolean modifiers removed) |
+| Numbers | `GG_D6_Numbers` | `MAT_Die_Label` | Regular engraved numbers |
+| Critical | `GG_D6_Numbers_Critical` | `MAT_Die_Label_Critical` | Highest-value face label (if enabled) |
+
+All objects in the set are exported into a single FBX file. In Unity you can swap each material independently — change body color, number color, and critical face color without re-exporting.
+
+Other export details:
+
+- Applies transforms so scale is `1,1,1` and rotation is identity
+- Writes to `//exports/unity/d6/grangol_d6_default.fbx` next to your `.blend` file
+- You can select multiple dice and export them all at once; each die gets its own subfolder
 
 ## Settings reference
 
@@ -51,6 +76,7 @@ Detailed setting documentation is in [SETTINGS.md](SETTINGS.md).
 - Custom image settings
 - Resin fin support settings
 - Geometry-specific settings
+- Unity-ready export conventions
 - Workflow notes
 
 

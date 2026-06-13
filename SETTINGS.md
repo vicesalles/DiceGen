@@ -19,7 +19,7 @@ The addon shows different geometry controls depending on the selected dice type,
 - `Generate Numbers`: turns number generation on or off.
 - `Number Scale`: scales the engraved numbers.
 - `Number Depth`: engraving depth in millimeters.
-- `Font`: font file used for text numbers.
+- `Font`: font file used for text numbers. Defaults to a system font (Arial on Windows, DejaVu on Linux, Helvetica on macOS). Falls back to Blender's built-in font if no system font is found.
 
 ## Orientation indicator settings
 
@@ -83,6 +83,41 @@ These appear only on dice types that use them.
 - `Top Point Height`: controls the top apex height.
 - `Bottom Point Height`: controls the bottom apex height.
 - `Dice Height`: used by D10, D100, and custom trapezohedrons to control body height or aspect ratio.
+
+## Unity-ready export
+
+The addon includes a built-in exporter that produces clean static meshes for game engines.
+
+- Select one or more dice **body** objects in the viewport.
+- Click **Export Selected as FBX**. This button is available in two places:
+  1. The **Object Properties** panel (orange cube tab), inside the *Dice Gen* section.
+  2. The **N-panel sidebar** (*DiceGen5* tab) under *Unity Export*.
+- Output is written to `//exports/unity/` relative to the current `.blend` file.
+
+### Export structure
+
+Each die is exported as a **set of separate objects** inside one FBX file. This lets you customize materials independently in Unity:
+
+| Piece | Object name | Material name | Description |
+|-------|------------|---------------|-------------|
+| Body | `GG_D6_Body` | `MAT_Die_Body` | Solid die body. Boolean modifiers are removed so the mesh stays intact. |
+| Numbers | `GG_D6_Numbers` | `MAT_Die_Label` | Regular number meshes. |
+| Critical | `GG_D6_Numbers_Critical` | `MAT_Die_Label_Critical` | Highest-value face label (only when *Use Critical Face Material* is enabled). |
+
+### Conventions
+
+- **Folder structure:** `exports/unity/d6/`, `exports/unity/d20/`, etc.
+- **File names:** `grangol_d6_default.fbx`
+- Transforms are applied so every object has identity scale/rotation and origin at world zero.
+- Bevel and bumper modifiers are baked into the body geometry.
+- A glTF Binary (`.glb`) fallback path is also available.
+
+### Unity workflow
+
+1. Import the FBX into Unity.
+2. In the Material Import Settings, choose *Use Embedded Materials*.
+3. Create material variants for `MAT_Die_Body`, `MAT_Die_Label`, and `MAT_Die_Label_Critical`.
+4. Assign different colors, textures, or shaders to each slot independently.
 
 ## Workflow notes
 
