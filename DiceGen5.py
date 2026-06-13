@@ -1,5 +1,6 @@
 import math
 import re
+import json
 import bpy
 import os
 import bmesh
@@ -3951,6 +3952,10 @@ def execute_generator(op, context, mesh_cls, name: str, **kwargs) -> Dict[str, s
         num_obj["dice_gen_type"] = mesh_cls.__name__
         apply_settings(num_obj.dice_gen_settings, settings_values)
 
+    # Build and store export metadata (face/value mapping, normals, up vectors)
+    die_type_label = _get_unity_type_label(die_obj)
+    die_obj["dice_export_metadata_raw"] = _build_export_metadata(die, die_obj, die_type_label)
+
     return {'FINISHED'}
 
 
@@ -4571,6 +4576,170 @@ def _rename_object_and_data(obj: bpy.types.Object, new_name: str) -> None:
         obj.data.name = new_name
 
 
+def _build_export_metadata(mesh_instance, body_obj: bpy.types.Object, die_type: str, asset_file: str = "") -> str:
+    """
+    Build a JSON metadata string describing the relationship between die
+    values and their face orientations. Uses the mesh class instance (which
+    has the generation-time face/number data) and the actual Blender mesh
+    (which has the final polygon normals and centers).
+
+    The returned string is stored on the body object and later adjusted
+    during export to account for geometric-center normalization.
+
+    Non-D4 dice export face-based metadata (normal + up/tangent per face).
+    D4 (Tetrahedron) exports result-based metadata because the D4 uses
+    vertex-oriented labels and the result convention is not "top face".
+    """
+    numbers = mesh_instance.get_numbers() if hasattr(mesh_instance, 'get_numbers') else []
+    rotations = mesh_instance.get_number_rotations() if hasattr(mesh_instance, 'get_number_rotations') else []
+    face_indices = get_number_face_indices(mesh_instance) if hasattr(mesh_instance, 'faces') and mesh_instance.faces else []
+
+    mesh_data = body_obj.data
+    if not mesh_data or not hasattr(mesh_data, 'polygons'):
+        return ""
+
+    # ------------------------------------------------------------------
+    # D4 (Tetrahedron) — vertex-oriented labels, result = value at the
+    # upward-pointing vertex. Export explicit result orientations.
+    # ------------------------------------------------------------------
+    if isinstance(mesh_instance, Tetrahedron):
+        vertices = mesh_instance.vertices or []
+        faces = mesh_instance.faces or []
+        if not vertices or not faces:
+            return ""
+
+        # Build face normals from the Blender mesh (already in local space)
+        face_normals: List[Vector] = []
+        for poly in mesh_data.polygons:
+            face_normals.append(Vector(poly.normal))
+
+        # Map each value to the vertex it is placed near.
+        # From get_number_locations(), the 12 numbers are grouped by vertex:
+        #   indices 0,1,2  → vertex 2 (value 1)
+        #   indices 3,4,5  → vertex 1 (value 2)
+        #   indices 6,7,8  → vertex 0 (value 3)
+        #   indices 9,10,11→ vertex 3 (value 4)
+        # face_info in get_number_locations() encodes (face_idx, target_vert).
+        # We derive the vertex mapping from that structure.
+        vertex_for_number = [2, 2, 2, 1, 1, 1, 0, 0, 0, 3, 3, 3]
+
+        # For each vertex, find the opposite face (the face that does NOT
+        # contain that vertex). When the die rests on that face, the vertex
+        # points up.
+        def _opposite_face(vertex_idx: int) -> int:
+            for f_idx, face in enumerate(faces):
+                if vertex_idx not in face:
+                    return f_idx
+            return 0
+
+        # Gather label instances per value
+        value_labels: Dict[str, List[Dict[str, Any]]] = {}
+        if numbers and rotations:
+            for num_idx in range(len(numbers)):
+                value = numbers[num_idx]
+                if value not in value_labels:
+                    value_labels[value] = []
+                up = [0.0, 1.0, 0.0]
+                if num_idx < len(rotations):
+                    rot = Euler(rotations[num_idx])
+                    up_vec = Vector((0.0, 1.0, 0.0))
+                    up_vec.rotate(rot)
+                    up = [round(up_vec.x, 6), round(up_vec.y, 6), round(up_vec.z, 6)]
+                face_idx = face_indices[num_idx] - 1 if face_indices and num_idx < len(face_indices) and face_indices[num_idx] > 0 else -1
+                value_labels[value].append({
+                    "face_index": face_idx,
+                    "up": up
+                })
+
+        results: List[Dict[str, Any]] = []
+        for value in sorted(value_labels.keys(), key=lambda x: int(x) if x.isdigit() else 0):
+            # Find the representative vertex for this value (all 3 instances share the same vertex)
+            rep_num_idx = numbers.index(value) if value in numbers else 0
+            up_vertex = vertex_for_number[rep_num_idx] if rep_num_idx < len(vertex_for_number) else 0
+            resting_face = _opposite_face(up_vertex)
+            resting_normal = [round(face_normals[resting_face].x, 6),
+                              round(face_normals[resting_face].y, 6),
+                              round(face_normals[resting_face].z, 6)] if resting_face < len(face_normals) else [0.0, 0.0, -1.0]
+
+            # Compute a rotation that aligns the resting face normal with world down (0,0,-1).
+            # This gives one valid orientation for this result. The spin around the vertical
+            # axis is arbitrary and not defined by the generator.
+            local_normal = face_normals[resting_face] if resting_face < len(face_normals) else Vector((0.0, 0.0, -1.0))
+            rot_quat = Vector((0.0, 0.0, -1.0)).rotation_difference(local_normal)
+            rot_euler = rot_quat.to_euler()
+            local_rotation = [round(rot_euler.x, 6), round(rot_euler.y, 6), round(rot_euler.z, 6)]
+
+            vert_pos = vertices[up_vertex] if up_vertex < len(vertices) else (0.0, 0.0, 0.0)
+
+            results.append({
+                "value": value,
+                "convention": "vertex_up",
+                "up_vertex": up_vertex,
+                "up_vertex_position": [round(vert_pos[0], 6), round(vert_pos[1], 6), round(vert_pos[2], 6)],
+                "resting_face": resting_face,
+                "resting_face_normal": resting_normal,
+                "local_rotation": local_rotation,
+                "label_instances": value_labels.get(value, [])
+            })
+
+        metadata: Dict[str, Any] = {
+            "die_type": "d4",
+            "asset_origin": "geometric_center",
+            "asset_file": asset_file,
+            "results": results,
+            "notes": (
+                "Tetrahedral D4 with vertex-oriented labels. "
+                "Each of the 4 values is printed near one vertex on all 3 adjacent faces. "
+                "The 'vertex_up' convention assumes the result is the value at the upward-pointing vertex. "
+                "local_rotation aligns the resting face normal with world down (0,0,-1); "
+                "spin around the vertical axis is not defined by the generator. "
+                "For deterministic rolling, the resting face is the one opposite the upright vertex."
+            )
+        }
+        return json.dumps(metadata, indent=2)
+
+    # ------------------------------------------------------------------
+    # Non-D4 dice — face-based metadata (normal + up/tangent per face)
+    # ------------------------------------------------------------------
+    faces_meta: List[Dict[str, Any]] = []
+    for poly in mesh_data.polygons:
+        faces_meta.append({
+            "face_index": poly.index,
+            "center": [round(poly.center.x, 6), round(poly.center.y, 6), round(poly.center.z, 6)],
+            "normal": [round(poly.normal.x, 6), round(poly.normal.y, 6), round(poly.normal.z, 6)],
+            "values": []
+        })
+
+    if face_indices and numbers:
+        for num_idx, face_idx in enumerate(face_indices):
+            if face_idx <= 0:
+                continue
+            face_data_idx = face_idx - 1
+            if face_data_idx >= len(faces_meta):
+                continue
+
+            value = numbers[num_idx] if num_idx < len(numbers) else "N/A"
+            up = [0.0, 1.0, 0.0]
+            if num_idx < len(rotations):
+                rot = Euler(rotations[num_idx])
+                up_vec = Vector((0.0, 1.0, 0.0))
+                up_vec.rotate(rot)
+                up = [round(up_vec.x, 6), round(up_vec.y, 6), round(up_vec.z, 6)]
+
+            faces_meta[face_data_idx]["values"].append({
+                "value": value,
+                "up": up
+            })
+
+    metadata = {
+        "die_type": die_type.lower().replace("_", ""),
+        "asset_origin": "geometric_center",
+        "asset_file": asset_file,
+        "faces": faces_meta
+    }
+    return json.dumps(metadata, indent=2)
+
+
 def _compute_geometric_center(obj: bpy.types.Object) -> Vector:
     """
     Compute the geometric center of a mesh object from its axis-aligned
@@ -4589,7 +4758,7 @@ def _compute_geometric_center(obj: bpy.types.Object) -> Vector:
                    (min(zs) + max(zs)) / 2.0))
 
 
-def _prepare_unity_export_set(body_obj: bpy.types.Object) -> List[bpy.types.Object]:
+def _prepare_unity_export_set(body_obj: bpy.types.Object) -> Tuple[List[bpy.types.Object], Vector]:
     """
     Create temporary export copies of the dice body and all its associated
     number/critical pieces. Removes boolean modifiers from the body so it
@@ -4601,10 +4770,10 @@ def _prepare_unity_export_set(body_obj: bpy.types.Object) -> List[bpy.types.Obje
     center for Unity import, regardless of where the 3D cursor was when the
     die was created or whether print-layout lift was applied.
 
-    Returns a list of export-ready objects (body, numbers, critical).
+    Returns (list of export-ready objects, center_offset vector).
     """
     if body_obj is None or body_obj.type != 'MESH':
-        return []
+        return [], Vector((0.0, 0.0, 0.0))
 
     dice_type = _get_unity_type_label(body_obj)
     export_objects: List[bpy.types.Object] = []
@@ -4612,7 +4781,7 @@ def _prepare_unity_export_set(body_obj: bpy.types.Object) -> List[bpy.types.Obje
     # --- Body ---
     body_copy = _duplicate_object(body_obj)
     if body_copy is None:
-        return []
+        return [], Vector((0.0, 0.0, 0.0))
     _remove_boolean_modifiers(body_copy)
 
     # Compute geometric center from the body mesh (local space, before any
@@ -4655,7 +4824,7 @@ def _prepare_unity_export_set(body_obj: bpy.types.Object) -> List[bpy.types.Obje
                 _rename_materials_for_unity(crit_copy)
                 export_objects.append(crit_copy)
 
-    return export_objects
+    return export_objects, center_offset
 
 
 def _export_objects_fbx(objects: List[bpy.types.Object], filepath: str) -> bool:
@@ -4745,7 +4914,7 @@ class DICE_OT_export_unity_ready(bpy.types.Operator):
             type_dir = os.path.join(base_dir, dice_type.lower().replace("_", ""))
             os.makedirs(type_dir, exist_ok=True)
 
-            export_set = _prepare_unity_export_set(body_obj)
+            export_set, center_offset = _prepare_unity_export_set(body_obj)
             if not export_set:
                 failed += 1
                 continue
@@ -4763,6 +4932,38 @@ class DICE_OT_export_unity_ready(bpy.types.Operator):
             if ok:
                 exported += 1
                 self.report({'INFO'}, f"Exported: {filepath} ({len(export_set)} objects)")
+
+                # Write sidecar JSON metadata, adjusting positions for normalization
+                raw_metadata = body_obj.get("dice_export_metadata_raw", "")
+                if raw_metadata:
+                    try:
+                        metadata = json.loads(raw_metadata)
+                        metadata["asset_file"] = os.path.basename(filepath)
+                        metadata["asset_origin"] = "geometric_center"
+
+                        # Non-D4: adjust face centers
+                        for face in metadata.get("faces", []):
+                            c = face.get("center", [0.0, 0.0, 0.0])
+                            face["center"] = [
+                                round(c[0] - center_offset.x, 6),
+                                round(c[1] - center_offset.y, 6),
+                                round(c[2] - center_offset.z, 6)
+                            ]
+
+                        # D4: adjust up_vertex_position for each result
+                        for result in metadata.get("results", []):
+                            p = result.get("up_vertex_position", [0.0, 0.0, 0.0])
+                            result["up_vertex_position"] = [
+                                round(p[0] - center_offset.x, 6),
+                                round(p[1] - center_offset.y, 6),
+                                round(p[2] - center_offset.z, 6)
+                            ]
+
+                        json_path = os.path.join(type_dir, filename + ".json")
+                        with open(json_path, 'w', encoding='utf-8') as f:
+                            json.dump(metadata, f, indent=2)
+                    except Exception:
+                        pass  # Silently skip if metadata is corrupt
             else:
                 failed += 1
                 self.report({'ERROR'}, f"Failed to export: {filepath}")
@@ -5812,6 +6013,10 @@ class DICE_OT_add_from_preset(bpy.types.Operator):
         target_object = numbers_objects[0] if numbers_objects else dice_obj
         dice_obj["dice_gen_type"] = mesh_class.__name__
         target_object["dice_gen_type"] = mesh_class.__name__
+
+        # Build and store export metadata (face/value mapping, normals, up vectors)
+        die_type_label = _get_unity_type_label(dice_obj)
+        dice_obj["dice_export_metadata_raw"] = _build_export_metadata(mesh, dice_obj, die_type_label)
 
         # Store settings on the object
         apply_settings(dice_obj.dice_gen_settings, settings_values)
