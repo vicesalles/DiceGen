@@ -42,6 +42,8 @@ The add-on will create a blank dice mesh and, if enabled, a separate numbers obj
 - Dedicated critical face material: assign a distinct material to the highest-value face label
 - Dot orientation indicator: place a small dot below `6` and `9` for visual clarity
 - Unity-ready FBX export: exports body, numbers, and critical face as separate objects with independent materials for easy customization
+- Face-center pivot export: place the object's origin at the center of any face for deterministic rolling scripts in Unity
+- Companion face-data text file: every export includes a `_faces.txt` with face indices, values, centers, and normals for easy Unity integration
 - Automatic system font selection on first use (falls back to Blender built-in if none found)
 
 ## Unity-ready export
@@ -60,6 +62,39 @@ The exporter produces **multiple objects per die** so you can customize material
 | Critical | `GG_D6_Numbers_Critical` | `MAT_Die_Label_Critical` | Highest-value face label (if enabled) |
 
 All objects in the set are exported into a single FBX file. In Unity you can swap each material independently — change body color, number color, and critical face color without re-exporting.
+
+### Face-center pivot (for deterministic rolling)
+
+In the operator redo panel (press **F9** after clicking export, or expand the operator settings in the sidebar), you can change **Pivot** from *Geometric Center* to *Face Center*. When enabled:
+
+- The object's origin is moved to the center of the specified face
+- All exported pieces (body, numbers, critical) are shifted together so they stay aligned
+- This gives your Unity script a natural pivot point on the touching-the-floor face instead of the geometric center
+
+To find the correct face index, enable Blender's **Face Index** overlay (*Viewport Overlays > Developer > Indices*).
+
+### Companion face-data text file
+
+Every export also writes a `grangol_d6_default_faces.txt` file in the same folder as the FBX. It contains:
+
+```
+# DiceGen Face Data for dice_body
+# Type: Cube
+# Total faces: 6
+# Pivot face index: None (geometric center)
+
+# Face data format: index | value | center_x | center_y | center_z | normal_x | normal_y | normal_z
+
+0 | 1 | 0.000000 | -0.500000 | 0.000000 | 0.000000 | -1.000000 | 0.000000
+1 | 2 | 0.500000 | 0.000000 | 0.000000 | 1.000000 | 0.000000 | 0.000000
+...
+```
+
+This makes it trivial to build a Unity rolling script:
+
+1. Read the text file at runtime (or parse it in the editor)
+2. Look up which face index corresponds to which die value
+3. Use the face center + normal to position and orient the die after a roll
 
 Other export details:
 

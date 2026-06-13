@@ -4571,12 +4571,35 @@ def _rename_object_and_data(obj: bpy.types.Object, new_name: str) -> None:
         obj.data.name = new_name
 
 
+def _compute_geometric_center(obj: bpy.types.Object) -> Vector:
+    """
+    Compute the geometric center of a mesh object from its axis-aligned
+    bounding box. Uses mesh vertices in local space so the result is
+    independent of the object's world transform.
+    """
+    if obj.type != 'MESH' or obj.data is None or not obj.data.vertices:
+        return Vector((0.0, 0.0, 0.0))
+
+    mesh = obj.data
+    xs = [v.co.x for v in mesh.vertices]
+    ys = [v.co.y for v in mesh.vertices]
+    zs = [v.co.z for v in mesh.vertices]
+    return Vector(((min(xs) + max(xs)) / 2.0,
+                   (min(ys) + max(ys)) / 2.0,
+                   (min(zs) + max(zs)) / 2.0))
+
+
 def _prepare_unity_export_set(body_obj: bpy.types.Object) -> List[bpy.types.Object]:
     """
     Create temporary export copies of the dice body and all its associated
     number/critical pieces. Removes boolean modifiers from the body so it
     stays solid, applies transforms, renames everything Unity-friendly, and
     renames materials to MAT_* conventions.
+
+    All exported objects are normalized so the die body's geometric center
+    becomes the world origin. This guarantees a clean pivot at the geometric
+    center for Unity import, regardless of where the 3D cursor was when the
+    die was created or whether print-layout lift was applied.
 
     Returns a list of export-ready objects (body, numbers, critical).
     """
@@ -4591,7 +4614,16 @@ def _prepare_unity_export_set(body_obj: bpy.types.Object) -> List[bpy.types.Obje
     if body_copy is None:
         return []
     _remove_boolean_modifiers(body_copy)
+
+    # Compute geometric center from the body mesh (local space, before any
+    # transform is applied). This is the offset we need to subtract so the
+    # center lands at the world origin.
+    center_offset = _compute_geometric_center(body_copy)
+
+    # Shift the body so its center moves to origin, then bake into mesh.
+    body_copy.location -= center_offset
     apply_transform(body_copy, use_location=True, use_rotation=True, use_scale=True)
+
     _rename_object_and_data(body_copy, f"GG_{dice_type}_Body")
     _rename_materials_for_unity(body_copy)
     export_objects.append(body_copy)
@@ -4603,6 +4635,8 @@ def _prepare_unity_export_set(body_obj: bpy.types.Object) -> List[bpy.types.Obje
         if numbers_obj and numbers_obj.type == 'MESH':
             num_copy = _duplicate_object(numbers_obj)
             if num_copy:
+                # Shift by the SAME offset so numbers stay aligned with body
+                num_copy.location -= center_offset
                 apply_transform(num_copy, use_location=True, use_rotation=True, use_scale=True)
                 _rename_object_and_data(num_copy, f"GG_{dice_type}_Numbers")
                 _rename_materials_for_unity(num_copy)
@@ -4615,6 +4649,7 @@ def _prepare_unity_export_set(body_obj: bpy.types.Object) -> List[bpy.types.Obje
         if critical_obj and critical_obj.type == 'MESH':
             crit_copy = _duplicate_object(critical_obj)
             if crit_copy:
+                crit_copy.location -= center_offset
                 apply_transform(crit_copy, use_location=True, use_rotation=True, use_scale=True)
                 _rename_object_and_data(crit_copy, f"GG_{dice_type}_Numbers_Critical")
                 _rename_materials_for_unity(crit_copy)

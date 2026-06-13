@@ -112,12 +112,56 @@ Each die is exported as a **set of separate objects** inside one FBX file. This 
 - Bevel and bumper modifiers are baked into the body geometry.
 - A glTF Binary (`.glb`) fallback path is also available.
 
+### Export options
+
+After triggering the export, the operator redo panel (press **F9**) or the sidebar operator settings let you tweak:
+
+- **Format:** `FBX` (default) or `glTF Binary`.
+- **Pivot:** `Geometric Center` (default) or `Face Center`.
+  - *Geometric Center:* the object's origin is at the die's center. Best for general use.
+  - *Face Center:* the object's origin is moved to the center of the specified face. All exported pieces (body, numbers, critical) are shifted together so they stay aligned. This is ideal for deterministic rolling scripts in Unity because the pivot sits on the touching-the-floor face instead of the center.
+- **Face Index:** (only when Pivot is *Face Center*) the 0-based mesh face index to use as the origin. Enable Blender's *Viewport Overlays > Developer > Indices* to see face numbers in the 3D view.
+
 ### Unity workflow
 
 1. Import the FBX into Unity.
 2. In the Material Import Settings, choose *Use Embedded Materials*.
 3. Create material variants for `MAT_Die_Body`, `MAT_Die_Label`, and `MAT_Die_Label_Critical`.
 4. Assign different colors, textures, or shaders to each slot independently.
+
+### Companion face-data text file
+
+Every export also produces a sidecar text file (e.g., `grangol_d6_default_faces.txt`) in the same folder. It lists every mesh face with:
+
+- `index` — the 0-based face index (matches Blender's Face Index overlay)
+- `value` — the number engraved on that face (e.g., `1`, `2`, `6`)
+- `center_x/y/z` — the face center in local space (after pivot shift if applicable)
+- `normal_x/y/z` — the face normal vector
+
+Example:
+
+```
+# DiceGen Face Data for dice_body
+# Type: Cube
+# Total faces: 6
+# Pivot face index: None (geometric center)
+
+# Face data format: index | value | center_x | center_y | center_z | normal_x | normal_y | normal_z
+
+0 | 1 | 0.000000 | -0.500000 | 0.000000 | 0.000000 | -1.000000 | 0.000000
+1 | 2 | 0.500000 | 0.000000 | 0.000000 | 1.000000 | 0.000000 | 0.000000
+...
+```
+
+You can parse this file at runtime or in the Unity Editor to build a lookup table from face index → die value, or to compute the resting transform from face center + normal.
+
+### Deterministic rolling tip
+
+If you are writing a script that snaps the die to a specific face:
+
+1. Export with **Pivot** set to *Face Center* and pick the face that will be the "resting" face (e.g., face 5 for the "6" side on a standard D6).
+2. In Unity, position the die so its origin sits on the floor collider.
+3. Rotate around the origin to animate rolls; when the animation finishes, the origin is already on the correct contact point.
 
 ## Workflow notes
 
